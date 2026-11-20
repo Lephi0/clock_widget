@@ -162,20 +162,12 @@ impl Default for WidgetConfig {
 
 impl WidgetConfig {
     pub fn config_path() -> PathBuf {
-        // Store locally in current working directory if writable, or next to executable
-        let cwd_path = PathBuf::from(CONFIG_FILE_NAME);
-        if cwd_path.exists() {
-            return cwd_path;
-        }
         if let Ok(exe_path) = std::env::current_exe() {
             if let Some(dir) = exe_path.parent() {
-                let candidate = dir.join(CONFIG_FILE_NAME);
-                if candidate.exists() {
-                    return candidate;
-                }
+                return dir.join(CONFIG_FILE_NAME);
             }
         }
-        cwd_path
+        PathBuf::from(CONFIG_FILE_NAME)
     }
 
     pub fn load() -> Self {
