@@ -1,0 +1,36 @@
+{
+  "window_pos": [
+    5362.0,
+    4.0
+  ],
+  "always_on_top": true,
+  "toggle_aot_hotkey": "Alt+Shift+T",
+  "background_mode": "FrostedGlass",
+  "compact_mode": true,
+  "clock_font_size": 20.0,
+  "date_font_size": 13.0,
+  "glass_tint_opacity": 0.5,
+  "glass_tint_preset": "System",
+  "show_tray_icon": true,
+  "show_seconds": false,
+  "use_24_hour": true,
+  "location_name": "Budapest",
+  "latitude": 47.49835,
+  "longitude": 19.04045,
+  "temp_unit": "Celsius",
+  "weather_provider": "GoogleMapsWeather",
+  "google_api_key": "",
+  "cached_weather": {
+    "temperature_c": 9.8,
+    "high_c": 12.4,
+    "low_c": 7.8,
+    "condition_label": "Overcast",
+    "condition_kind": "Cloudy",
+    "humidity": 81,
+    "wind_kph": 19.4,
+    "provider_used": "Open-Meteo (Keyless Fallback)",
+    "updated_at_epoch": 1795125608,
+    "location_label": "Budapest",
+    "is_offline_cache": false
+  }
+}
