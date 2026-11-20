@@ -1,7 +1,7 @@
 {
   "window_pos": [
-    5362.0,
-    4.0
+    5389.0,
+    2.0
   ],
   "always_on_top": true,
   "toggle_aot_hotkey": "Alt+Shift+T",
@@ -21,15 +21,15 @@
   "weather_provider": "GoogleMapsWeather",
   "google_api_key": "",
   "cached_weather": {
-    "temperature_c": 9.8,
-    "high_c": 12.4,
-    "low_c": 7.8,
-    "condition_label": "Overcast",
-    "condition_kind": "Cloudy",
-    "humidity": 81,
-    "wind_kph": 19.4,
+    "temperature_c": 8.0,
+    "high_c": 14.0,
+    "low_c": 7.0,
+    "condition_label": "Clear",
+    "condition_kind": "ClearNight",
+    "humidity": 79,
+    "wind_kph": 3.2,
     "provider_used": "Open-Meteo (Keyless Fallback)",
-    "updated_at_epoch": 1795125608,
+    "updated_at_epoch": 1795202590,
     "location_label": "Budapest",
     "is_offline_cache": false
   }

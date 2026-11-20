@@ -7,32 +7,32 @@ use windows_sys::Win32::{
     Foundation::{HWND, POINT, RECT},
     Graphics::{
         Dwm::{
+            DWM_BB_BLURREGION, DWM_BB_ENABLE, DWM_BLURBEHIND, DWM_SYSTEMBACKDROP_TYPE, DWMSBT_NONE,
+            DWMSBT_TRANSIENTWINDOW, DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE,
+            DWMWA_TRANSITIONS_FORCEDISABLED, DWMWA_USE_IMMERSIVE_DARK_MODE,
+            DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND,
             DwmEnableBlurBehindWindow, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
-            DWMSBT_NONE, DWMSBT_TRANSIENTWINDOW, DWMWCP_DONOTROUND, DWMWCP_ROUND,
-            DWMWA_BORDER_COLOR, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_TRANSITIONS_FORCEDISABLED,
-            DWMWA_USE_IMMERSIVE_DARK_MODE, DWMWA_WINDOW_CORNER_PREFERENCE, DWM_BB_BLURREGION,
-            DWM_BB_ENABLE, DWM_BLURBEHIND, DWM_SYSTEMBACKDROP_TYPE,
         },
         Gdi::{
-            CreateRectRgn, DeleteObject, GetMonitorInfoW, MonitorFromPoint, MONITORINFO,
-            MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTONULL,
+            CreateRectRgn, DeleteObject, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST,
+            MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint,
         },
     },
     System::{
-        Registry::{RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_DWORD},
+        Registry::{HKEY_CURRENT_USER, RRF_RT_REG_DWORD, RegGetValueW},
         Threading::{GetCurrentProcess, GetCurrentProcessId, SetProcessWorkingSetSize},
     },
     UI::{
         Controls::{
-            SetWindowThemeAttribute, MARGINS, WTA_NONCLIENT, WTA_OPTIONS, WTNCA_NODRAWCAPTION,
+            MARGINS, SetWindowThemeAttribute, WTA_NONCLIENT, WTA_OPTIONS, WTNCA_NODRAWCAPTION,
             WTNCA_NODRAWICON, WTNCA_NOMIRRORHELP, WTNCA_NOSYSMENU,
         },
         WindowsAndMessaging::{
-            FindWindowExW, GetCursorPos, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-            GetWindowThreadProcessId, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-            ShowWindow, GWL_EXSTYLE, GWL_STYLE, HWND_TOPMOST, SM_CXSCREEN, SM_CYSCREEN,
-            SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
-            SWP_SHOWWINDOW, SW_HIDE, SW_RESTORE, SW_SHOW, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
+            FindWindowExW, GWL_EXSTYLE, GWL_STYLE, GetCursorPos, GetSystemMetrics,
+            GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, HWND_TOPMOST, SM_CXSCREEN,
+            SM_CYSCREEN, SW_HIDE, SW_RESTORE, SW_SHOW, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+            SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
+            SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
             WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_SYSMENU,
         },
     },
@@ -40,7 +40,7 @@ use windows_sys::Win32::{
 
 // DWMWA_COLOR_NONE = 0xFFFFFFFE suppresses the Windows 11 1px system border
 #[cfg(windows)]
-const DWMWA_COLOR_NONE: u32 = 0xFFFFFFFE;
+const DWMWA_COLOR_NONE: u32 = 0xFFFFFFFF;
 
 pub fn extract_hwnd(cc: &eframe::CreationContext<'_>) -> Option<isize> {
     let handle = cc.window_handle().ok()?;
@@ -54,9 +54,10 @@ pub fn extract_hwnd(cc: &eframe::CreationContext<'_>) -> Option<isize> {
 pub fn is_windows_light_theme() -> bool {
     #[cfg(windows)]
     unsafe {
-        let subkey: Vec<u16> = "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
-            .encode_utf16()
-            .collect();
+        let subkey: Vec<u16> =
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize\0"
+                .encode_utf16()
+                .collect();
         let value_name: Vec<u16> = "AppsUseLightTheme\0".encode_utf16().collect();
         let mut data: u32 = 0;
         let mut size: u32 = std::mem::size_of::<u32>() as u32;
@@ -414,7 +415,11 @@ pub fn clamp_rect_to_work_area(
 }
 
 /// Clamps a popup window position to the nearest monitor's work area in physical pixels.
-pub fn clamp_popup_pos_to_monitor_px(anchor_px: [i32; 2], width_px: i32, height_px: i32) -> [i32; 2] {
+pub fn clamp_popup_pos_to_monitor_px(
+    anchor_px: [i32; 2],
+    width_px: i32,
+    height_px: i32,
+) -> [i32; 2] {
     #[cfg(windows)]
     unsafe {
         let pt = POINT {
@@ -500,8 +505,7 @@ pub fn configure_popup_window(hwnd_raw: Option<isize>) {
             );
 
             let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-            let new_ex_style =
-                (ex_style | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
+            let new_ex_style = (ex_style | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
             if new_ex_style != ex_style {
                 SetWindowLongPtrW(hwnd, GWL_EXSTYLE, new_ex_style);
                 let _ = SetWindowPos(
@@ -535,15 +539,7 @@ pub fn position_popup_window_px(
         let hwnd = raw as HWND;
         unsafe {
             let flags = if show { SWP_SHOWWINDOW } else { SWP_NOACTIVATE };
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                x_px,
-                y_px,
-                width_px,
-                height_px,
-                flags,
-            );
+            let _ = SetWindowPos(hwnd, HWND_TOPMOST, x_px, y_px, width_px, height_px, flags);
             if show {
                 let _ = SetForegroundWindow(hwnd);
             }
