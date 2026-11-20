@@ -5,28 +5,36 @@ mod dwm;
 mod glass;
 mod hotkey;
 mod icons;
+mod settings_ui;
 mod tray;
 mod weather;
 
 use chrono::{Local, Timelike};
 use config::{BackgroundMode, GlassTintPreset, TempUnit, WidgetConfig, WeatherProvider};
 use dwm::{
-    bring_hwnd_to_front, clamp_popup_pos_to_monitor_px, configure_popup_window, extract_hwnd,
-    find_own_window_by_title, get_cursor_pos_px, get_window_pos_px, hide_popup_window,
-    is_windows_light_theme, position_popup_window_px, primary_monitor_center_pos_px,
-    resize_window_px, set_window_pos_px_checked, trim_process_working_set,
+    bring_hwnd_to_front, clamp_popup_pos_to_monitor_px, configure_popup_window,
+    configure_settings_window, extract_hwnd, find_own_window_by_title, get_cursor_pos_px,
+    get_monitor_work_area_for_hwnd, get_window_pos_px, hide_popup_window, is_windows_light_theme,
+    position_popup_window_px, primary_monitor_center_pos_px, resize_window_px,
+    resolve_window_pos_in_work_area, set_window_pos_px_checked, trim_process_working_set,
 };
 use egui::{
     Align, Align2, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
-    Frame, Id, Key, Margin, Painter, PointerButton, Pos2, Rect, Sense, Stroke, Vec2,
+    Frame, Id, Key, Margin, Painter, PointerButton, Pos2, Rect, RichText, Sense, Stroke, Vec2,
     ViewportBuilder, ViewportClass, ViewportCommand, ViewportId, WindowLevel,
 };
 use glass::{
-    draw_glass_background, draw_glass_surface_with_alpha, GlassPalette, GlassStyle,
-    GlassWindowBackdrop,
+    apply_glass_visuals, draw_glass_background, draw_glass_surface,
+    draw_glass_surface_with_alpha, GlassPalette, GlassStyle, GlassWindowBackdrop,
 };
 use hotkey::{capture_egui_shortcut, HotkeyController};
 use icons::draw_weather_icon;
+use settings_ui::{
+    draw_settings_tab_bar, draw_settings_titlebar, draw_status_pill, glass_button, glass_card,
+    glass_location_result_row, glass_primary_button, glass_recording_button,
+    glass_segmented_control, glass_slider_row, glass_toggle_row, OptionsWindowState, SettingsTab,
+    OPTIONS_WINDOW_HEIGHT, OPTIONS_WINDOW_TITLE, OPTIONS_WINDOW_WIDTH,
+};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tray::{TrayAction, TrayController};
@@ -39,7 +47,7 @@ const WIDGET_WIDTH: f32 = 348.0;
 const WIDGET_HEIGHT: f32 = 176.0;
 const CONTEXT_MENU_WINDOW_TITLE: &str = "Clock & Weather Context Menu";
 const CONTEXT_MENU_WIDTH: f32 = 236.0;
-const CONTEXT_MENU_HEIGHT: f32 = 160.0;
+const CONTEXT_MENU_HEIGHT: f32 = 178.0;
 const CONTEXT_MENU_FADE_IN_SECS: f32 = 0.15;
 const CONTEXT_MENU_FADE_OUT_SECS: f32 = 0.12;
 const CARD_MARGIN: f32 = 0.0;
@@ -90,7 +98,7 @@ fn main() -> eframe::Result<()> {
         .with_transparent(true)
         .with_taskbar(false)
         .with_resizable(false)
-        .with_icon(app_icon)
+        .with_icon(app_icon.clone())
         .with_window_level(if initial_config.always_on_top {
             WindowLevel::AlwaysOnTop
         } else {
@@ -109,7 +117,7 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Clock & Weather Widget",
         native_options,
-        Box::new(|cc| Ok(Box::new(ClockWeatherWidgetApp::new(cc, initial_config)))),
+        Box::new(|cc| Ok(Box::new(ClockWeatherWidgetApp::new(cc, initial_config, app_icon)))),
     )
 }
 
@@ -192,6 +200,7 @@ impl ContextMenuState {
 
 struct ClockWeatherWidgetApp {
     config: WidgetConfig,
+    app_icon: egui::IconData,
     hwnd: Option<isize>,
     windows_is_light: bool,
     widget_glass_backdrop: GlassWindowBackdrop,
@@ -214,7 +223,7 @@ struct ClockWeatherWidgetApp {
 
     // Context menu & Options window state
     context_menu: ContextMenuState,
-    options_open: bool,
+    options_window: OptionsWindowState,
 
     // Options window editable buffers
     city_search_query: String,
@@ -230,7 +239,11 @@ struct ClockWeatherWidgetApp {
 }
 
 impl ClockWeatherWidgetApp {
-    fn new(cc: &eframe::CreationContext<'_>, mut config: WidgetConfig) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        mut config: WidgetConfig,
+        app_icon: egui::IconData,
+    ) -> Self {
         install_system_font(&cc.egui_ctx);
 
         let hwnd = extract_hwnd(cc);
@@ -269,6 +282,7 @@ impl ClockWeatherWidgetApp {
 
         let mut app = Self {
             config,
+            app_icon,
             hwnd,
             windows_is_light,
             widget_glass_backdrop: GlassWindowBackdrop::new(),
@@ -283,7 +297,7 @@ impl ClockWeatherWidgetApp {
             last_observed_pos_px: Some(actual_px),
             pos_dirty_since: None,
             context_menu: ContextMenuState::default(),
-            options_open: false,
+            options_window: OptionsWindowState::default(),
             city_search_query: String::new(),
             city_search_results: Vec::new(),
             city_search_error: None,
@@ -470,11 +484,12 @@ impl ClockWeatherWidgetApp {
                 }
                 TrayAction::OpenOptions => {
                     self.begin_close_context_menu(ctx);
-                    self.options_open = true;
-                    bring_hwnd_to_front(self.hwnd);
+                    self.open_options_window(ctx);
                 }
                 TrayAction::CloseApp => {
                     self.finish_close_context_menu();
+                    self.persist_options_window_pos();
+                    hide_popup_window(self.options_window.hwnd);
                     let _ = self.config.save();
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
@@ -482,7 +497,9 @@ impl ClockWeatherWidgetApp {
         }
 
         // 3. Poll Weather & Geocoding Worker
+        let mut received_weather_msg = false;
         for msg in self.weather_manager.poll() {
+            received_weather_msg = true;
             match msg {
                 WeatherWorkerMessage::WeatherFetched(Ok(data)) => {
                     self.config.cached_weather = Some(data.clone());
@@ -509,6 +526,9 @@ impl ClockWeatherWidgetApp {
                     trim_process_working_set();
                 }
             }
+        }
+        if received_weather_msg && self.options_window.open {
+            ctx.request_repaint_of(ViewportId::from_hash_of("clock_widget_options_viewport"));
         }
 
         // 4. Periodic 20-minute weather refresh (skipped in Compact Mode to save resources)
@@ -560,6 +580,7 @@ impl eframe::App for ClockWeatherWidgetApp {
         if let Some(pos_px) = get_window_pos_px(self.hwnd).or(self.last_observed_pos_px) {
             self.config.window_pos = Some([pos_px[0] as f32, pos_px[1] as f32]);
         }
+        self.persist_options_window_pos();
         let _ = self.config.save();
     }
 
@@ -592,8 +613,8 @@ impl eframe::App for ClockWeatherWidgetApp {
             self.show_context_menu_viewport(ctx);
         }
 
-        // 5. Render Options Window in its own native viewport when open
-        if self.options_open {
+        // 5. Render Options Window in its own native glass viewport when open
+        if self.options_window.open {
             self.show_options_viewport(ctx);
         }
 
@@ -624,12 +645,16 @@ impl eframe::App for ClockWeatherWidgetApp {
             Duration::from_millis(ms_until_next_minute.min(2500))
         };
 
-        if self.context_menu.is_animating() {
+        if self.context_menu.is_animating()
+            || (self.options_window.open && !self.options_window.activated)
+        {
             next_repaint = next_repaint.min(Duration::from_millis(16));
         } else if self.context_menu.open {
             next_repaint = next_repaint.min(Duration::from_millis(100));
-        } else if self.pos_dirty_since.is_some() {
+        } else if self.pos_dirty_since.is_some() || self.options_window.pos_dirty_since.is_some() {
             next_repaint = next_repaint.min(Duration::from_millis(200));
+        } else if self.options_window.open {
+            next_repaint = next_repaint.min(Duration::from_millis(250));
         }
 
         ctx.request_repaint_after(next_repaint);
@@ -1373,10 +1398,28 @@ impl ClockWeatherWidgetApp {
             ("Close", false, None, true),
         ];
 
+        let mut cur_y = inner.min.y;
         for (idx, (label, is_checked, right_badge, is_danger)) in rows.iter().enumerate() {
-            let y = inner.min.y + idx as f32 * (row_h + 2.0);
+            if idx == 4 || idx == 5 {
+                let div_y = cur_y + 5.5;
+                painter.line_segment(
+                    [
+                        Pos2::new(inner.min.x + 8.0, div_y),
+                        Pos2::new(inner.max.x - 8.0, div_y),
+                    ],
+                    Stroke::new(1.0_f32, palette.divider.gamma_multiply(fade_alpha)),
+                );
+                cur_y += 11.0;
+            }
+
             let item_rect =
-                Rect::from_min_size(Pos2::new(inner.min.x, y), Vec2::new(inner.width(), row_h));
+                Rect::from_min_size(Pos2::new(inner.min.x, cur_y), Vec2::new(inner.width(), row_h));
+            cur_y += if idx == 3 || idx == 4 {
+                row_h
+            } else {
+                row_h + 2.0
+            };
+
             let resp = ui.interact(
                 item_rect,
                 Id::new(("ctx_menu_row", idx)),
@@ -1473,10 +1516,12 @@ impl ClockWeatherWidgetApp {
                     }
                     4 => {
                         self.begin_close_context_menu(root_ctx);
-                        self.options_open = true;
+                        self.open_options_window(root_ctx);
                     }
                     5 => {
                         self.finish_close_context_menu();
+                        self.persist_options_window_pos();
+                        hide_popup_window(self.options_window.hwnd);
                         let _ = self.config.save();
                         root_ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
                     }
@@ -1487,63 +1532,295 @@ impl ClockWeatherWidgetApp {
         }
     }
 
-    fn show_options_viewport(&mut self, ctx: &Context) {
-        let viewport_id = ViewportId::from_hash_of("clock_widget_options_viewport");
-        let builder = ViewportBuilder::default()
-            .with_title("Widget Options")
-            .with_inner_size([450.0, 590.0])
-            .with_min_inner_size([420.0, 500.0])
-            .with_resizable(true)
-            .with_decorations(true)
-            .with_transparent(false)
-            .with_window_level(WindowLevel::AlwaysOnTop);
+    fn open_options_window(&mut self, root_ctx: &Context) {
+        if self.options_window.open {
+            bring_hwnd_to_front(self.options_window.hwnd);
+            return;
+        }
 
-        ctx.show_viewport_immediate(viewport_id, builder, |opt_ctx, class| {
+        let work_rect = get_monitor_work_area_for_hwnd(self.hwnd, self.last_observed_pos_px);
+        let ppp = root_ctx.pixels_per_point().max(1.0);
+        let work_h_logical = ((work_rect[3] - work_rect[1]) as f32 / ppp).max(400.0);
+        let logical_h = OPTIONS_WINDOW_HEIGHT
+            .min((work_h_logical - 32.0).max(400.0))
+            .round();
+        let logical_size = Vec2::new(OPTIONS_WINDOW_WIDTH, logical_h);
+        let size_px = [
+            (logical_size.x * ppp).round() as i32,
+            (logical_size.y * ppp).round() as i32,
+        ];
+        let saved_px = self
+            .config
+            .options_window_pos
+            .map(|[x, y]| [x.round() as i32, y.round() as i32]);
+        let pos_px = resolve_window_pos_in_work_area(saved_px, size_px, work_rect);
+        let logical_pos = Pos2::new(pos_px[0] as f32 / ppp, pos_px[1] as f32 / ppp);
+
+        self.options_window.reset_keeping_tab();
+        self.options_window.open = true;
+        self.options_window.logical_size = logical_size;
+        self.options_window.locked_pos_px = pos_px;
+        self.options_window.locked_size_px = size_px;
+        self.options_window.locked_logical_pos = logical_pos;
+        self.options_window.last_observed_pos_px = Some(pos_px);
+        root_ctx.request_repaint();
+    }
+
+    fn persist_options_window_pos(&mut self) {
+        if self.options_window.open && self.options_window.activated {
+            if let Some(pos_px) = get_window_pos_px(self.options_window.hwnd)
+                .or(self.options_window.last_observed_pos_px)
+            {
+                self.config.options_window_pos = Some([pos_px[0] as f32, pos_px[1] as f32]);
+            }
+        }
+    }
+
+    fn close_options_window(&mut self) {
+        if !self.options_window.open {
+            return;
+        }
+        self.persist_options_window_pos();
+        let _ = self.config.save();
+        hide_popup_window(self.options_window.hwnd);
+        self.options_window.reset_keeping_tab();
+        self.recording_hotkey = false;
+        trim_process_working_set();
+    }
+
+    fn show_options_viewport(&mut self, root_ctx: &Context) {
+        let logical_size = self.options_window.logical_size;
+        let pos_px = self.options_window.locked_pos_px;
+        let size_px = self.options_window.locked_size_px;
+
+        let viewport_id = ViewportId::from_hash_of("clock_widget_options_viewport");
+        let mut builder = ViewportBuilder::default()
+            .with_title(OPTIONS_WINDOW_TITLE)
+            .with_inner_size([logical_size.x, logical_size.y])
+            .with_min_inner_size([logical_size.x, logical_size.y])
+            .with_max_inner_size([logical_size.x, logical_size.y])
+            .with_visible(self.options_window.revealed)
+            .with_decorations(false)
+            .with_minimize_button(false)
+            .with_maximize_button(false)
+            .with_close_button(false)
+            .with_transparent(true)
+            .with_resizable(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_icon(self.app_icon.clone());
+
+        if !self.options_window.activated {
+            builder = builder.with_position(self.options_window.locked_logical_pos);
+        }
+
+        root_ctx.show_viewport_immediate(viewport_id, builder, |opt_ctx, class| {
+            let glass_style = self.current_glass_style();
+            let palette = glass_style.palette();
+            apply_glass_visuals(opt_ctx, &glass_style);
+
             if class == ViewportClass::Embedded {
-                let mut open = self.options_open;
-                egui::Window::new("Widget Options")
+                let mut open = self.options_window.open;
+                let mut done_clicked = false;
+                egui::Window::new(OPTIONS_WINDOW_TITLE)
                     .open(&mut open)
                     .show(opt_ctx, |ui| {
-                        self.render_options_contents(opt_ctx, ui);
+                        done_clicked = self.render_options_frame(
+                            root_ctx,
+                            opt_ctx,
+                            ui,
+                            &glass_style,
+                            &palette,
+                        );
                     });
-                self.options_open = open;
+                if !open || done_clicked {
+                    self.close_options_window();
+                    root_ctx.request_repaint();
+                }
                 return;
             }
 
-            if opt_ctx.input(|i| i.viewport().close_requested()) {
-                self.options_open = false;
-                self.recording_hotkey = false;
-                trim_process_working_set();
+            if self.options_window.hwnd.is_none() {
+                self.options_window.hwnd = find_own_window_by_title(OPTIONS_WINDOW_TITLE);
+                if self.options_window.hwnd.is_none() {
+                    root_ctx.request_repaint();
+                    return;
+                }
+            }
+
+            // Frame 1 (hidden): suppress transitions, apply Acrylic glass backdrop, and place on target monitor.
+            if !self.options_window.revealed {
+                configure_settings_window(self.options_window.hwnd);
+                self.options_window.glass_backdrop.sync(
+                    self.options_window.hwnd,
+                    BackgroundMode::FrostedGlass,
+                    glass_style.is_light(),
+                );
+                position_popup_window_px(
+                    self.options_window.hwnd,
+                    pos_px[0],
+                    pos_px[1],
+                    size_px[0],
+                    size_px[1],
+                    false,
+                );
+
+                egui::CentralPanel::default()
+                    .frame(Frame::NONE.fill(Color32::TRANSPARENT))
+                    .show(opt_ctx, |ui| {
+                        let _ = self.render_options_frame(
+                            root_ctx,
+                            opt_ctx,
+                            ui,
+                            &glass_style,
+                            &palette,
+                        );
+                    });
+
+                self.options_window.revealed = true;
+                opt_ctx.request_repaint();
+                root_ctx.request_repaint();
                 return;
             }
 
-            let mut visuals = egui::Visuals::dark();
-            visuals.panel_fill = Color32::from_rgb(22, 25, 34);
-            visuals.window_fill = Color32::from_rgb(22, 25, 34);
-            visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(32, 36, 48);
-            visuals.widgets.inactive.bg_fill = Color32::from_rgb(38, 43, 58);
-            visuals.widgets.hovered.bg_fill = Color32::from_rgb(50, 58, 78);
-            visuals.widgets.active.bg_fill = Color32::from_rgb(58, 122, 238);
-            opt_ctx.set_visuals(visuals);
+            // Frame 2: reveal and focus cleanly without DWM transition flicker.
+            if !self.options_window.activated {
+                configure_settings_window(self.options_window.hwnd);
+                position_popup_window_px(
+                    self.options_window.hwnd,
+                    pos_px[0],
+                    pos_px[1],
+                    size_px[0],
+                    size_px[1],
+                    true,
+                );
+                self.options_window.glass_backdrop.invalidate();
+                self.options_window.glass_backdrop.sync(
+                    self.options_window.hwnd,
+                    BackgroundMode::FrostedGlass,
+                    glass_style.is_light(),
+                );
+                self.options_window.activated = true;
+
+                let actual = get_window_pos_px(self.options_window.hwnd).unwrap_or(pos_px);
+                self.options_window.last_observed_pos_px = Some(actual);
+                let actual_f = [actual[0] as f32, actual[1] as f32];
+                if self.config.options_window_pos != Some(actual_f) {
+                    self.config.options_window_pos = Some(actual_f);
+                    let _ = self.config.save();
+                }
+            } else {
+                self.options_window.glass_backdrop.sync(
+                    self.options_window.hwnd,
+                    BackgroundMode::FrostedGlass,
+                    glass_style.is_light(),
+                );
+            }
+
+            let (close_req, esc_pressed) = opt_ctx.input(|i| {
+                (
+                    i.viewport().close_requested(),
+                    i.key_pressed(Key::Escape),
+                )
+            });
+            let mut should_close = close_req
+                || (esc_pressed && !self.recording_hotkey && !opt_ctx.wants_keyboard_input());
+
+            // Track physical drag moves via Win32 GetWindowRect and debounce persistence
+            if let Some(cur_px) = get_window_pos_px(self.options_window.hwnd) {
+                let changed = match self.options_window.last_observed_pos_px {
+                    Some(prev) => (prev[0] - cur_px[0]).abs() > 1 || (prev[1] - cur_px[1]).abs() > 1,
+                    None => {
+                        self.options_window.last_observed_pos_px = Some(cur_px);
+                        false
+                    }
+                };
+                if changed {
+                    self.options_window.last_observed_pos_px = Some(cur_px);
+                    self.options_window.pos_dirty_since = Some(Instant::now());
+                }
+            }
+            if let Some(dirty_time) = self.options_window.pos_dirty_since {
+                let is_dragging = opt_ctx.input(|i| i.pointer.primary_down());
+                if !is_dragging && dirty_time.elapsed() >= Duration::from_millis(350) {
+                    if let Some(cur_px) = self.options_window.last_observed_pos_px {
+                        self.config.options_window_pos = Some([cur_px[0] as f32, cur_px[1] as f32]);
+                        let _ = self.config.save();
+                    }
+                    self.options_window.pos_dirty_since = None;
+                }
+            }
 
             egui::CentralPanel::default()
-                .frame(
-                    Frame::NONE
-                        .fill(Color32::from_rgb(22, 25, 34))
-                        .inner_margin(Margin::same(16)),
-                )
+                .frame(Frame::NONE.fill(Color32::TRANSPARENT))
                 .show(opt_ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            self.render_options_contents(opt_ctx, ui);
-                        });
+                    let frame_close = self.render_options_frame(
+                        root_ctx,
+                        opt_ctx,
+                        ui,
+                        &glass_style,
+                        &palette,
+                    );
+                    should_close |= frame_close;
                 });
+
+            if should_close {
+                self.close_options_window();
+                root_ctx.request_repaint();
+            }
         });
     }
 
-    fn render_options_contents(&mut self, opt_ctx: &Context, ui: &mut egui::Ui) {
-        // Capture keybind if recording is active
+    fn render_options_frame(
+        &mut self,
+        root_ctx: &Context,
+        opt_ctx: &Context,
+        ui: &mut egui::Ui,
+        glass_style: &GlassStyle,
+        palette: &GlassPalette,
+    ) -> bool {
+        let full_rect = ui.max_rect();
+        draw_glass_surface(ui.painter(), full_rect, glass_style);
+
+        ui.spacing_mut().item_spacing.y = 0.0;
+
+        let close_top = draw_settings_titlebar(opt_ctx, ui, palette);
+        ui.add_space(10.0);
+
+        Frame::NONE.inner_margin(Margin::symmetric(16, 0)).show(ui, |ui| {
+            draw_settings_tab_bar(ui, palette, &mut self.options_window.active_tab);
+        });
+        ui.add_space(10.0);
+
+        let scroll_h = ui.available_height().max(120.0);
+        ui.allocate_ui(Vec2::new(ui.available_width(), scroll_h), |ui| {
+            ui.set_min_size(Vec2::new(ui.available_width(), scroll_h));
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 7.0;
+                    Frame::NONE
+                        .inner_margin(Margin {
+                            left: 16,
+                            right: 16,
+                            top: 2,
+                            bottom: 14,
+                        })
+                        .show(ui, |ui| {
+                            self.render_options_contents(root_ctx, opt_ctx, ui, palette);
+                        });
+                });
+        });
+
+        close_top
+    }
+
+    fn render_options_contents(
+        &mut self,
+        root_ctx: &Context,
+        opt_ctx: &Context,
+        ui: &mut egui::Ui,
+        palette: &GlassPalette,
+    ) {
         if self.recording_hotkey {
             if let Some(captured) = capture_egui_shortcut(opt_ctx) {
                 self.recording_hotkey = false;
@@ -1571,422 +1848,486 @@ impl ClockWeatherWidgetApp {
             }
         }
 
-        ui.heading(
-            egui::RichText::new("Clock & Weather Widget Settings")
-                .size(18.0)
-                .strong()
-                .color(Color32::from_rgb(242, 246, 255)),
-        );
-        ui.add_space(10.0);
-
-        // --- SECTION 1: LOCATION & TEMPERATURE UNITS ---
-        Self::section_card(ui, "Location & Temperature Units", |ui| {
-            ui.label("City Lookup (auto-fills coordinates):");
-            ui.horizontal(|ui| {
-                let resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.city_search_query)
-                        .hint_text("e.g. Tokyo, London, New York, Paris...")
-                        .desired_width(240.0),
-                );
-                let enter_pressed =
-                    resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
-                if (ui.button("Search City").clicked() || enter_pressed)
-                    && !self.city_search_query.trim().is_empty()
-                {
-                    self.weather_manager
-                        .trigger_city_search(self.city_search_query.clone(), opt_ctx.clone());
-                }
-                if self.weather_manager.is_searching_city {
-                    ui.spinner();
-                }
-            });
-
-            if let Some(ref err) = self.city_search_error {
-                ui.colored_label(Color32::from_rgb(255, 110, 110), err);
-            }
-
-            if !self.city_search_results.is_empty() {
-                ui.add_space(4.0);
-                ui.label(
-                    egui::RichText::new("Select a matching location:")
-                        .size(11.5)
-                        .color(Color32::from_rgb(175, 190, 215)),
-                );
-                let results = self.city_search_results.clone();
-                for loc in results {
-                    let btn_txt = format!(
-                        "• {}  ({:.3}, {:.3})",
-                        loc.display_name, loc.latitude, loc.longitude
-                    );
-                    if ui.button(btn_txt).clicked() {
-                        self.config.location_name = loc.short_name.clone();
-                        self.config.latitude = loc.latitude;
-                        self.config.longitude = loc.longitude;
-                        self.location_name_input = loc.short_name;
-                        self.lat_input = format!("{:.4}", loc.latitude);
-                        self.lon_input = format!("{:.4}", loc.longitude);
-                        self.city_search_results.clear();
-                        let _ = self.config.save();
-                        self.request_weather_refresh(opt_ctx);
+        match self.options_window.active_tab {
+            SettingsTab::Appearance => {
+                glass_card(ui, palette, "Display & Glass", |ui| {
+                    let mut compact = self.config.compact_mode;
+                    if glass_toggle_row(
+                        ui,
+                        "opt_compact_mode",
+                        palette,
+                        "Compact Mode",
+                        Some("Single-line clock & date that fits inside titlebars"),
+                        &mut compact,
+                    ) {
+                        self.set_compact_mode(root_ctx, compact);
+                        root_ctx.request_repaint();
                     }
-                }
+
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Normal Mode Background")
+                            .size(12.0)
+                            .color(palette.secondary_text),
+                    );
+                    let current_bg = if self.config.compact_mode {
+                        None
+                    } else {
+                        Some(self.config.background_mode)
+                    };
+                    if let Some(mode) = glass_segmented_control(
+                        ui,
+                        "opt_bg_mode",
+                        palette,
+                        &[
+                            (BackgroundMode::FrostedGlass, BackgroundMode::FrostedGlass.label()),
+                            (BackgroundMode::Transparent, BackgroundMode::Transparent.label()),
+                        ],
+                        current_bg,
+                    ) {
+                        self.set_background_mode(root_ctx, mode);
+                        root_ctx.request_repaint();
+                    }
+
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("Glass Theme")
+                            .size(12.0)
+                            .color(palette.secondary_text),
+                    );
+                    if let Some(preset) = glass_segmented_control(
+                        ui,
+                        "opt_glass_preset",
+                        palette,
+                        &[
+                            (GlassTintPreset::Dark, GlassTintPreset::Dark.label()),
+                            (GlassTintPreset::Light, GlassTintPreset::Light.label()),
+                            (GlassTintPreset::System, GlassTintPreset::System.label()),
+                        ],
+                        Some(self.config.glass_tint_preset),
+                    ) {
+                        self.config.glass_tint_preset = preset;
+                        self.ensure_dwm_synced();
+                        let _ = self.config.save();
+                        root_ctx.request_repaint();
+                    }
+
+                    ui.add_space(8.0);
+                    let mut pct = (self.config.glass_tint_opacity * 100.0).round();
+                    if glass_slider_row(
+                        ui,
+                        palette,
+                        "Glass Tint Opacity",
+                        &mut pct,
+                        10.0..=95.0,
+                        1.0,
+                        "%",
+                    ) {
+                        self.config.glass_tint_opacity = (pct / 100.0).clamp(0.05, 0.95);
+                        let _ = self.config.save();
+                        root_ctx.request_repaint();
+                    }
+
+                    if self.config.compact_mode
+                        || self.config.background_mode == BackgroundMode::Transparent
+                    {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new(
+                                "Theme & opacity also style the context menu and this settings window.",
+                            )
+                            .size(11.0)
+                            .color(palette.muted_text),
+                        );
+                    }
+                });
+
+                ui.add_space(10.0);
+
+                glass_card(ui, palette, "Clock & Typography", |ui| {
+                    if glass_slider_row(
+                        ui,
+                        palette,
+                        "Clock Text Size",
+                        &mut self.config.clock_font_size,
+                        10.0..=80.0,
+                        1.0,
+                        " px",
+                    ) {
+                        self.measured_compact_size = None;
+                        self.ensure_window_size_synced(root_ctx);
+                        let _ = self.config.save();
+                        root_ctx.request_repaint();
+                    }
+
+                    ui.add_space(4.0);
+                    if glass_slider_row(
+                        ui,
+                        palette,
+                        "Date Text Size",
+                        &mut self.config.date_font_size,
+                        8.0..=48.0,
+                        1.0,
+                        " px",
+                    ) {
+                        self.measured_compact_size = None;
+                        self.ensure_window_size_synced(root_ctx);
+                        let _ = self.config.save();
+                        root_ctx.request_repaint();
+                    }
+
+                    ui.add_space(4.0);
+                    if glass_toggle_row(
+                        ui,
+                        "opt_24h",
+                        palette,
+                        "24-Hour Clock",
+                        None,
+                        &mut self.config.use_24_hour,
+                    ) {
+                        self.measured_compact_size = None;
+                        self.ensure_window_size_synced(root_ctx);
+                        let _ = self.config.save();
+                        root_ctx.request_repaint();
+                    }
+
+                    if glass_toggle_row(
+                        ui,
+                        "opt_seconds",
+                        palette,
+                        "Show Seconds",
+                        None,
+                        &mut self.config.show_seconds,
+                    ) {
+                        self.measured_compact_size = None;
+                        self.ensure_window_size_synced(root_ctx);
+                        let _ = self.config.save();
+                        root_ctx.request_repaint();
+                    }
+                });
             }
 
-            ui.add_space(6.0);
-            egui::Grid::new("loc_coords_grid")
-                .num_columns(2)
-                .spacing([12.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Display Label:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.location_name_input)
-                            .desired_width(180.0),
+            SettingsTab::Weather => {
+                glass_card(ui, palette, "Location & Units", |ui| {
+                    ui.label(
+                        RichText::new("City Lookup")
+                            .size(12.0)
+                            .color(palette.secondary_text),
                     );
-                    ui.end_row();
-
-                    ui.label("Latitude / Longitude:");
                     ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.lat_input)
-                                .hint_text("Lat")
-                                .desired_width(84.0),
+                        let input_w = (ui.available_width() - 102.0).max(160.0);
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.city_search_query)
+                                .hint_text("e.g. Tokyo, London, New York...")
+                                .desired_width(input_w),
                         );
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.lon_input)
-                                .hint_text("Lon")
-                                .desired_width(84.0),
+                        let enter_pressed =
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                        if (glass_primary_button(ui, palette, "Search").clicked() || enter_pressed)
+                            && !self.city_search_query.trim().is_empty()
+                        {
+                            self.weather_manager.trigger_city_search(
+                                self.city_search_query.clone(),
+                                root_ctx.clone(),
+                            );
+                        }
+                        if self.weather_manager.is_searching_city {
+                            ui.spinner();
+                        }
+                    });
+
+                    if let Some(ref err) = self.city_search_error {
+                        ui.label(
+                            RichText::new(err)
+                                .size(11.5)
+                                .color(palette.danger_text),
                         );
-                        if ui.button("Apply & Fetch").clicked() {
-                            if let (Ok(lat), Ok(lon)) = (
-                                self.lat_input.trim().parse::<f64>(),
-                                self.lon_input.trim().parse::<f64>(),
+                    }
+
+                    if !self.city_search_results.is_empty() {
+                        ui.add_space(2.0);
+                        ui.label(
+                            RichText::new("Select a matching location:")
+                                .size(11.5)
+                                .color(palette.muted_text),
+                        );
+                        let results = self.city_search_results.clone();
+                        for (idx, loc) in results.into_iter().enumerate() {
+                            if glass_location_result_row(
+                                ui,
+                                ("city_res", idx),
+                                palette,
+                                &loc.display_name,
+                                loc.latitude,
+                                loc.longitude,
                             ) {
-                                self.config.latitude = lat.clamp(-90.0, 90.0);
-                                self.config.longitude = lon.clamp(-180.0, 180.0);
-                                self.config.location_name =
-                                    self.location_name_input.trim().to_string();
+                                self.config.location_name = loc.short_name.clone();
+                                self.config.latitude = loc.latitude;
+                                self.config.longitude = loc.longitude;
+                                self.location_name_input = loc.short_name;
+                                self.lat_input = format!("{:.4}", loc.latitude);
+                                self.lon_input = format!("{:.4}", loc.longitude);
+                                self.city_search_results.clear();
                                 let _ = self.config.save();
-                                self.request_weather_refresh(opt_ctx);
+                                self.request_weather_refresh(root_ctx);
+                                root_ctx.request_repaint();
                             }
                         }
-                    });
-                    ui.end_row();
+                    }
 
-                    ui.label("Temperature Unit:");
-                    ui.horizontal(|ui| {
-                        for unit in [TempUnit::Celsius, TempUnit::Fahrenheit] {
-                            let label = match unit {
-                                TempUnit::Celsius => "Celsius (°C)",
-                                TempUnit::Fahrenheit => "Fahrenheit (°F)",
-                            };
-                            if ui
-                                .selectable_label(self.config.temp_unit == unit, label)
-                                .clicked()
-                            {
-                                self.config.temp_unit = unit;
-                                let _ = self.config.save();
-                            }
-                        }
-                    });
-                    ui.end_row();
+                    ui.add_space(6.0);
+                    egui::Grid::new("loc_coords_grid")
+                        .num_columns(2)
+                        .spacing([12.0, 8.0])
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new("Display Label")
+                                    .size(12.0)
+                                    .color(palette.secondary_text),
+                            );
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.location_name_input)
+                                    .desired_width(236.0),
+                            );
+                            ui.end_row();
+
+                            ui.label(
+                                RichText::new("Coordinates")
+                                    .size(12.0)
+                                    .color(palette.secondary_text),
+                            );
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.lat_input)
+                                        .hint_text("Lat")
+                                        .desired_width(80.0),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.lon_input)
+                                        .hint_text("Lon")
+                                        .desired_width(80.0),
+                                );
+                                if glass_button(ui, palette, "Apply").clicked() {
+                                    if let (Ok(lat), Ok(lon)) = (
+                                        self.lat_input.trim().parse::<f64>(),
+                                        self.lon_input.trim().parse::<f64>(),
+                                    ) {
+                                        self.config.latitude = lat.clamp(-90.0, 90.0);
+                                        self.config.longitude = lon.clamp(-180.0, 180.0);
+                                        self.config.location_name =
+                                            self.location_name_input.trim().to_string();
+                                        let _ = self.config.save();
+                                        self.request_weather_refresh(root_ctx);
+                                        root_ctx.request_repaint();
+                                    }
+                                }
+                            });
+                            ui.end_row();
+                        });
+
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Temperature Unit")
+                            .size(12.0)
+                            .color(palette.secondary_text),
+                    );
+                    if let Some(unit) = glass_segmented_control(
+                        ui,
+                        "opt_temp_unit",
+                        palette,
+                        &[
+                            (TempUnit::Celsius, "Celsius (°C)"),
+                            (TempUnit::Fahrenheit, "Fahrenheit (°F)"),
+                        ],
+                        Some(self.config.temp_unit),
+                    ) {
+                        self.config.temp_unit = unit;
+                        let _ = self.config.save();
+                        root_ctx.request_repaint();
+                    }
                 });
-        });
 
-        ui.add_space(10.0);
+                ui.add_space(10.0);
 
-        // --- SECTION 2: WEATHER API PROVIDER & API KEY ---
-        Self::section_card(ui, "Weather API Provider", |ui| {
-            ui.horizontal(|ui| {
-                ui.label("Provider:");
-                for provider in [
-                    WeatherProvider::GoogleMapsWeather,
-                    WeatherProvider::OpenMeteo,
-                ] {
-                    if ui
-                        .selectable_label(
-                            self.config.weather_provider == provider,
-                            provider.label(),
-                        )
-                        .clicked()
-                    {
+                glass_card(ui, palette, "Weather Provider", |ui| {
+                    ui.label(
+                        RichText::new("Data Source")
+                            .size(12.0)
+                            .color(palette.secondary_text),
+                    );
+                    if let Some(provider) = glass_segmented_control(
+                        ui,
+                        "opt_weather_provider",
+                        palette,
+                        &[
+                            (WeatherProvider::GoogleMapsWeather, "Google Weather"),
+                            (WeatherProvider::OpenMeteo, WeatherProvider::OpenMeteo.label()),
+                        ],
+                        Some(self.config.weather_provider),
+                    ) {
                         self.config.weather_provider = provider;
                         let _ = self.config.save();
-                        self.request_weather_refresh(opt_ctx);
+                        self.request_weather_refresh(root_ctx);
+                        root_ctx.request_repaint();
                     }
-                }
-            });
 
-            ui.add_space(4.0);
-            ui.label("Google Maps Platform Weather API Key (Optional):");
-            ui.horizontal(|ui| {
-                let key_resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.config.google_api_key)
-                        .password(!self.show_api_key)
-                        .hint_text("Leave blank for automatic keyless Open-Meteo fallback")
-                        .desired_width(275.0),
-                );
-                if key_resp.changed() {
-                    let _ = self.config.save();
-                }
-                let eye_label = if self.show_api_key { "Hide" } else { "Show" };
-                if ui.button(eye_label).clicked() {
-                    self.show_api_key = !self.show_api_key;
-                }
-                if ui.button("Refresh Now").clicked() {
-                    let _ = self.config.save();
-                    self.request_weather_refresh(opt_ctx);
-                }
-            });
-
-            if let Some(ref w) = self.weather {
-                ui.label(
-                    egui::RichText::new(format!(
-                        "Active source: {} • Current: {}",
-                        w.provider_used,
-                        self.config.temp_unit.format_temp_with_unit(w.temperature_c)
-                    ))
-                    .size(11.5)
-                    .color(Color32::from_rgb(155, 210, 175)),
-                );
-            }
-        });
-
-        ui.add_space(10.0);
-
-        // --- SECTION 3: APPEARANCE & FROSTED GLASS ---
-        Self::section_card(ui, "Appearance & Frosted Glass", |ui| {
-            let mut compact = self.config.compact_mode;
-            if ui
-                .checkbox(
-                    &mut compact,
-                    "Compact Mode (Single-Line Clock & Date — Fits Titlebars)",
-                )
-                .changed()
-            {
-                self.set_compact_mode(opt_ctx, compact);
-            }
-
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Normal Mode Background:");
-                for mode in [BackgroundMode::FrostedGlass, BackgroundMode::Transparent] {
-                    let is_selected =
-                        !self.config.compact_mode && self.config.background_mode == mode;
-                    if ui.selectable_label(is_selected, mode.label()).clicked() {
-                        self.set_background_mode(opt_ctx, mode);
-                    }
-                }
-            });
-
-            ui.add_space(4.0);
-            ui.add_enabled_ui(
-                !self.config.compact_mode
-                    && self.config.background_mode == BackgroundMode::FrostedGlass,
-                |ui| {
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Google Maps Weather API Key (Optional)")
+                            .size(12.0)
+                            .color(palette.secondary_text),
+                    );
                     ui.horizontal(|ui| {
-                        ui.label("Glass Tint Opacity:");
-                        let mut pct = (self.config.glass_tint_opacity * 100.0).round();
-                        if ui
-                            .add(egui::Slider::new(&mut pct, 10.0..=95.0).suffix("%"))
-                            .changed()
-                        {
-                            self.config.glass_tint_opacity = (pct / 100.0).clamp(0.05, 0.95);
+                        let key_w = (ui.available_width() - 134.0).max(150.0);
+                        let key_resp = ui.add(
+                            egui::TextEdit::singleline(&mut self.config.google_api_key)
+                                .password(!self.show_api_key)
+                                .hint_text("Blank = keyless Open-Meteo fallback")
+                                .desired_width(key_w),
+                        );
+                        if key_resp.changed() {
                             let _ = self.config.save();
+                        }
+                        let eye_label = if self.show_api_key { "Hide" } else { "Show" };
+                        if glass_button(ui, palette, eye_label).clicked() {
+                            self.show_api_key = !self.show_api_key;
+                        }
+                        if glass_button(ui, palette, "Refresh").clicked() {
+                            let _ = self.config.save();
+                            self.request_weather_refresh(root_ctx);
                         }
                     });
 
-                    ui.horizontal(|ui| {
-                        ui.label("Glass Tint Style:");
-                        for preset in [
-                            GlassTintPreset::Dark,
-                            GlassTintPreset::Light,
-                            GlassTintPreset::System,
-                        ] {
-                            if ui
-                                .selectable_label(
-                                    self.config.glass_tint_preset == preset,
-                                    preset.label(),
-                                )
-                                .clicked()
-                            {
-                                self.config.glass_tint_preset = preset;
-                                self.ensure_dwm_synced();
-                                let _ = self.config.save();
-                            }
-                        }
-                    });
-                },
-            );
-
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Clock Text Size:");
-                if ui
-                    .add(
-                        egui::Slider::new(&mut self.config.clock_font_size, 10.0..=80.0)
-                            .step_by(1.0)
-                            .suffix(" px"),
-                    )
-                    .changed()
-                {
-                    self.measured_compact_size = None;
-                    self.ensure_window_size_synced(opt_ctx);
-                    let _ = self.config.save();
-                }
-            });
-
-            ui.horizontal(|ui| {
-                ui.label("Date Text Size:");
-                if ui
-                    .add(
-                        egui::Slider::new(&mut self.config.date_font_size, 8.0..=48.0)
-                            .step_by(1.0)
-                            .suffix(" px"),
-                    )
-                    .changed()
-                {
-                    self.measured_compact_size = None;
-                    self.ensure_window_size_synced(opt_ctx);
-                    let _ = self.config.save();
-                }
-            });
-
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui
-                    .checkbox(&mut self.config.use_24_hour, "24-Hour Clock")
-                    .changed()
-                {
-                    self.measured_compact_size = None;
-                    self.ensure_window_size_synced(opt_ctx);
-                    let _ = self.config.save();
-                }
-                ui.add_space(12.0);
-                if ui
-                    .checkbox(&mut self.config.show_seconds, "Show Seconds")
-                    .changed()
-                {
-                    self.measured_compact_size = None;
-                    self.ensure_window_size_synced(opt_ctx);
-                    let _ = self.config.save();
-                }
-            });
-        });
-
-        ui.add_space(10.0);
-
-        // --- SECTION 4: ALWAYS ON TOP & GLOBAL KEYBIND ---
-        Self::section_card(ui, "Always on Top & Global Hotkey", |ui| {
-            let mut aot = self.config.always_on_top;
-            if ui
-                .checkbox(&mut aot, "Pin Widget Always on Top of Other Windows")
-                .changed()
-            {
-                self.set_always_on_top(opt_ctx, aot);
-            }
-
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.label("Global Shortcut:");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.hotkey_input)
-                        .desired_width(135.0)
-                        .hint_text("e.g. Alt+Shift+T"),
-                );
-
-                if ui.button("Apply Keybind").clicked() {
-                    let candidate = self.hotkey_input.trim().to_string();
-                    match self.hotkey_controller.set_shortcut(&candidate) {
-                        Ok(()) => {
-                            self.config.toggle_aot_hotkey =
-                                self.hotkey_controller.active_shortcut_str.clone();
-                            self.hotkey_input = self.config.toggle_aot_hotkey.clone();
-                            let _ = self.config.save();
-                            self.hotkey_feedback = Some((
-                                format!("Registered: {}", self.config.toggle_aot_hotkey),
-                                true,
-                            ));
-                        }
-                        Err(err) => {
-                            self.hotkey_feedback = Some((err, false));
-                        }
-                    }
-                }
-
-                let rec_txt = if self.recording_hotkey {
-                    "Press Keys... (Esc to cancel)"
-                } else {
-                    "Record Shortcut"
-                };
-                if ui.button(rec_txt).clicked() {
-                    self.recording_hotkey = !self.recording_hotkey;
-                }
-            });
-
-            if let Some((ref msg, ok)) = self.hotkey_feedback {
-                let col = if ok {
-                    Color32::from_rgb(130, 225, 160)
-                } else {
-                    Color32::from_rgb(255, 115, 115)
-                };
-                ui.colored_label(col, msg);
-            }
-        });
-
-        ui.add_space(10.0);
-
-        // --- SECTION 5: SYSTEM TRAY & WINDOW POSITION ---
-        Self::section_card(ui, "System Tray & Window Controls", |ui| {
-            let mut show_tray = self.config.show_tray_icon;
-            if ui
-                .checkbox(
-                    &mut show_tray,
-                    "Show Windows System Tray Icon (applies immediately)",
-                )
-                .changed()
-            {
-                self.config.show_tray_icon = show_tray;
-                self.tray_controller
-                    .set_enabled(show_tray, self.config.always_on_top);
-                let _ = self.config.save();
-            }
-
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                if ui.button("Center Widget on Primary Monitor").clicked() {
-                    self.reset_position_to_center(opt_ctx);
-                }
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("Done").clicked() {
-                        self.options_open = false;
-                        self.recording_hotkey = false;
-                        trim_process_working_set();
+                    if let Some(ref w) = self.weather {
+                        ui.add_space(2.0);
+                        let dot_color = if w.is_offline_cache {
+                            palette.accent_text
+                        } else {
+                            palette.success_text
+                        };
+                        let cache_suffix = if w.is_offline_cache { " (Cached)" } else { "" };
+                        let status_text = format!(
+                            "Active: {}{}  •  {}",
+                            w.provider_used,
+                            cache_suffix,
+                            self.config.temp_unit.format_temp_with_unit(w.temperature_c)
+                        );
+                        draw_status_pill(ui, palette, dot_color, &status_text);
                     }
                 });
-            });
-        });
-    }
+            }
 
-    fn section_card(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
-        Frame::NONE
-            .fill(Color32::from_rgb(30, 34, 46))
-            .corner_radius(CornerRadius::same(12))
-            .inner_margin(Margin::same(12))
-            .stroke(Stroke::new(
-                1.0_f32,
-                Color32::from_rgba_unmultiplied(255, 255, 255, 24),
-            ))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(
-                    egui::RichText::new(title)
-                        .size(13.5)
-                        .strong()
-                        .color(Color32::from_rgb(198, 214, 248)),
-                );
-                ui.add_space(6.0);
-                add_contents(ui);
-            });
+            SettingsTab::System => {
+                glass_card(ui, palette, "Always on Top & Global Hotkey", |ui| {
+                    let mut aot = self.config.always_on_top;
+                    if glass_toggle_row(
+                        ui,
+                        "opt_aot",
+                        palette,
+                        "Pin Widget Always on Top",
+                        Some("Keeps the clock widget above other windows"),
+                        &mut aot,
+                    ) {
+                        self.set_always_on_top(root_ctx, aot);
+                        root_ctx.request_repaint();
+                    }
+
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Global Toggle Shortcut")
+                            .size(12.0)
+                            .color(palette.secondary_text),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.hotkey_input)
+                                .desired_width(142.0)
+                                .hint_text("e.g. Alt+Shift+T"),
+                        );
+
+                        if glass_button(ui, palette, "Apply").clicked() {
+                            let candidate = self.hotkey_input.trim().to_string();
+                            match self.hotkey_controller.set_shortcut(&candidate) {
+                                Ok(()) => {
+                                    self.config.toggle_aot_hotkey =
+                                        self.hotkey_controller.active_shortcut_str.clone();
+                                    self.hotkey_input = self.config.toggle_aot_hotkey.clone();
+                                    let _ = self.config.save();
+                                    self.hotkey_feedback = Some((
+                                        format!("Registered: {}", self.config.toggle_aot_hotkey),
+                                        true,
+                                    ));
+                                }
+                                Err(err) => {
+                                    self.hotkey_feedback = Some((err, false));
+                                }
+                            }
+                        }
+
+                        let rec_clicked = if self.recording_hotkey {
+                            glass_recording_button(ui, palette, "Press Keys... (Esc)").clicked()
+                        } else {
+                            glass_button(ui, palette, "Record").clicked()
+                        };
+                        if rec_clicked {
+                            self.recording_hotkey = !self.recording_hotkey;
+                        }
+                    });
+
+                    if let Some((ref msg, ok)) = self.hotkey_feedback {
+                        ui.add_space(2.0);
+                        let dot_color = if ok {
+                            palette.success_text
+                        } else {
+                            palette.danger_text
+                        };
+                        draw_status_pill(ui, palette, dot_color, msg);
+                    }
+                });
+
+                ui.add_space(10.0);
+
+                glass_card(ui, palette, "System Tray & Window", |ui| {
+                    let mut show_tray = self.config.show_tray_icon;
+                    if glass_toggle_row(
+                        ui,
+                        "opt_tray",
+                        palette,
+                        "Show System Tray Icon",
+                        Some("Display quick controls in the Windows notification area"),
+                        &mut show_tray,
+                    ) {
+                        self.config.show_tray_icon = show_tray;
+                        self.tray_controller
+                            .set_enabled(show_tray, self.config.always_on_top);
+                        let _ = self.config.save();
+                    }
+
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 1.0;
+                            ui.label(
+                                RichText::new("Widget Position")
+                                    .size(12.5)
+                                    .color(palette.primary_text),
+                            );
+                            ui.label(
+                                RichText::new("Move the clock back to the primary monitor center")
+                                    .size(11.0)
+                                    .color(palette.muted_text),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                            if glass_button(ui, palette, "Center Widget").clicked() {
+                                self.reset_position_to_center(root_ctx);
+                                root_ctx.request_repaint();
+                            }
+                        });
+                    });
+                });
+            }
+        }
     }
 }
 
@@ -2072,11 +2413,20 @@ mod tests {
         cfg.background_mode = BackgroundMode::Transparent;
         cfg.always_on_top = true;
         cfg.window_pos = Some([420.0, 280.0]);
+        cfg.options_window_pos = Some([1980.0, 210.0]);
         let json = serde_json::to_string(&cfg).expect("serialize config");
         let parsed: WidgetConfig = serde_json::from_str(&json).expect("deserialize config");
         assert_eq!(parsed.background_mode, BackgroundMode::Transparent);
         assert!(parsed.always_on_top);
         assert_eq!(parsed.window_pos, Some([420.0, 280.0]));
+        assert_eq!(parsed.options_window_pos, Some([1980.0, 210.0]));
+
+        // Legacy config JSON missing `options_window_pos` deserializes cleanly
+        let legacy_json = r#"{"window_pos":[100.0,120.0],"always_on_top":false}"#;
+        let legacy: WidgetConfig =
+            serde_json::from_str(legacy_json).expect("deserialize legacy config");
+        assert_eq!(legacy.window_pos, Some([100.0, 120.0]));
+        assert_eq!(legacy.options_window_pos, None);
     }
 
     #[test]

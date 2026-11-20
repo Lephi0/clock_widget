@@ -102,6 +102,7 @@ pub enum WeatherProvider {
 }
 
 impl WeatherProvider {
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             WeatherProvider::GoogleMapsWeather => "Google Maps Platform Weather API",
@@ -114,6 +115,7 @@ impl WeatherProvider {
 #[serde(default)]
 pub struct WidgetConfig {
     pub window_pos: Option<[f32; 2]>,
+    pub options_window_pos: Option<[f32; 2]>,
     pub always_on_top: bool,
     pub toggle_aot_hotkey: String,
     pub background_mode: BackgroundMode,
@@ -138,6 +140,7 @@ impl Default for WidgetConfig {
     fn default() -> Self {
         Self {
             window_pos: None,
+            options_window_pos: None,
             always_on_top: false,
             toggle_aot_hotkey: "Alt+Shift+T".to_string(),
             background_mode: BackgroundMode::FrostedGlass,

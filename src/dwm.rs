@@ -15,7 +15,7 @@ use windows_sys::Win32::{
         },
         Gdi::{
             CreateRectRgn, DeleteObject, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST,
-            MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint,
+            MONITOR_DEFAULTTONULL, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
         },
     },
     System::{
@@ -38,9 +38,9 @@ use windows_sys::Win32::{
     },
 };
 
-// DWMWA_COLOR_NONE = 0xFFFFFFFE suppresses the Windows 11 1px system border
+// DWMWA_COLOR_DEFAULT = 0xFFFFFFFF restores the default Windows 11 1px system border
 #[cfg(windows)]
-const DWMWA_COLOR_NONE: u32 = 0xFFFFFFFF;
+const DWMWA_COLOR_DEFAULT: u32 = 0xFFFFFFFF;
 
 pub fn extract_hwnd(cc: &eframe::CreationContext<'_>) -> Option<isize> {
     let handle = cc.window_handle().ok()?;
@@ -152,7 +152,7 @@ pub fn sync_window_blur(hwnd_raw: Option<isize>, mode: BackgroundMode, is_light:
                 std::mem::size_of::<u32>() as u32,
             );
 
-            let no_border: u32 = DWMWA_COLOR_NONE;
+            let default_border: u32 = DWMWA_COLOR_DEFAULT;
 
             match mode {
                 BackgroundMode::FrostedGlass => {
@@ -180,14 +180,6 @@ pub fn sync_window_blur(hwnd_raw: Option<isize>, mode: BackgroundMode, is_light:
                         DWMWA_SYSTEMBACKDROP_TYPE as u32,
                         &backdrop_acrylic as *const _ as *const _,
                         std::mem::size_of::<DWM_SYSTEMBACKDROP_TYPE>() as u32,
-                    );
-
-                    // Suppress the Windows 11 1px system border
-                    let _ = DwmSetWindowAttribute(
-                        hwnd,
-                        DWMWA_BORDER_COLOR as u32,
-                        &no_border as *const u32 as *const _,
-                        std::mem::size_of::<u32>() as u32,
                     );
                 }
                 BackgroundMode::Transparent => {
@@ -217,15 +209,16 @@ pub fn sync_window_blur(hwnd_raw: Option<isize>, mode: BackgroundMode, is_light:
                         &corner_pref as *const u32 as *const _,
                         std::mem::size_of::<u32>() as u32,
                     );
-
-                    let _ = DwmSetWindowAttribute(
-                        hwnd,
-                        DWMWA_BORDER_COLOR as u32,
-                        &no_border as *const u32 as *const _,
-                        std::mem::size_of::<u32>() as u32,
-                    );
                 }
             }
+
+            // Use the default Windows 11 1px system border
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_BORDER_COLOR as u32,
+                &default_border as *const u32 as *const _,
+                std::mem::size_of::<u32>() as u32,
+            );
 
             // 3. Always enable per-pixel alpha composition with an empty 0-pixel blur region `CreateRectRgn(0, 0, -1, -1)`
             // AFTER configuring margins/backdrop so WGL OpenGL (`glow`) alpha=0 pixels are 100% transparent.
@@ -490,6 +483,103 @@ pub fn find_own_window_by_title(title: &str) -> Option<isize> {
     None
 }
 
+/// Returns `[left, top, right, bottom]` of the target monitor's work area in physical pixels.
+pub fn get_monitor_work_area_for_hwnd(
+    hwnd_raw: Option<isize>,
+    fallback_pos_px: Option<[i32; 2]>,
+) -> [i32; 4] {
+    #[cfg(windows)]
+    unsafe {
+        let hmon = if let Some(raw) = hwnd_raw {
+            MonitorFromWindow(raw as HWND, MONITOR_DEFAULTTONEAREST)
+        } else if let Some([x, y]) = fallback_pos_px {
+            MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST)
+        } else {
+            MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTONEAREST)
+        };
+
+        if !hmon.is_null() {
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                rcMonitor: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                rcWork: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 0,
+                    bottom: 0,
+                },
+                dwFlags: 0,
+            };
+            if GetMonitorInfoW(hmon, &mut info) != 0 {
+                return [
+                    info.rcWork.left,
+                    info.rcWork.top,
+                    info.rcWork.right,
+                    info.rcWork.bottom,
+                ];
+            }
+        }
+
+        let screen_w = GetSystemMetrics(SM_CXSCREEN).max(800);
+        let screen_h = GetSystemMetrics(SM_CYSCREEN).max(600);
+        [0, 0, screen_w, screen_h]
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (hwnd_raw, fallback_pos_px);
+        [0, 0, 1920, 1080]
+    }
+}
+
+/// Resolves a window position inside `work_rect` (`[left, top, right, bottom]`), restoring `saved_pos`
+/// if its center lies within `work_rect` (clamped to stay inside), or centering inside `work_rect`.
+pub fn resolve_window_pos_in_work_area(
+    saved_pos: Option<[i32; 2]>,
+    size: [i32; 2],
+    work_rect: [i32; 4],
+) -> [i32; 2] {
+    let [left, top, right, bottom] = work_rect;
+    let max_x = (right - size[0]).max(left);
+    let max_y = (bottom - size[1]).max(top);
+
+    if let Some([x, y]) = saved_pos {
+        let cx = x + size[0] / 2;
+        let cy = y + size[1] / 2;
+        if cx >= left && cx < right && cy >= top && cy < bottom {
+            return [x.clamp(left, max_x), y.clamp(top, max_y)];
+        }
+    }
+
+    let x = (left + (right - left - size[0]) / 2).clamp(left, max_x);
+    let y = (top + (bottom - top - size[1]) / 2).clamp(top, max_y);
+    [x, y]
+}
+
+/// Disables Windows DWM open/close/restore transitions for the frameless Settings window
+/// while keeping normal taskbar and Alt-Tab visibility.
+pub fn configure_settings_window(hwnd_raw: Option<isize>) {
+    #[cfg(windows)]
+    if let Some(raw) = hwnd_raw {
+        let hwnd = raw as HWND;
+        unsafe {
+            let disable_transitions: u32 = 1;
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_TRANSITIONS_FORCEDISABLED as u32,
+                &disable_transitions as *const u32 as *const _,
+                std::mem::size_of::<u32>() as u32,
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = hwnd_raw;
+}
+
 /// Disables Windows DWM open/close/restore transitions and configures tool-window extended style for popups.
 pub fn configure_popup_window(hwnd_raw: Option<isize>) {
     #[cfg(windows)]
@@ -573,7 +663,61 @@ pub fn trim_process_working_set() {
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_rect_to_work_area;
+    use super::{clamp_rect_to_work_area, resolve_window_pos_in_work_area};
+
+    #[test]
+    fn test_resolve_window_pos_in_work_area() {
+        let primary = [0, 0, 1920, 1040];
+        let right_monitor = [1920, 0, 3840, 1040];
+        let left_monitor = [-1920, 0, 0, 1040];
+        let size = [468, 564];
+
+        // Default centering on primary and secondary monitors
+        assert_eq!(
+            resolve_window_pos_in_work_area(None, size, primary),
+            [(1920 - 468) / 2, (1040 - 564) / 2]
+        );
+        assert_eq!(
+            resolve_window_pos_in_work_area(None, size, right_monitor),
+            [1920 + (1920 - 468) / 2, (1040 - 564) / 2]
+        );
+        assert_eq!(
+            resolve_window_pos_in_work_area(None, size, left_monitor),
+            [-1920 + (1920 - 468) / 2, (1040 - 564) / 2]
+        );
+
+        // Exact restoration on the same monitor (including flush-edge parked position)
+        assert_eq!(
+            resolve_window_pos_in_work_area(Some([1920, 0]), size, right_monitor),
+            [1920, 0]
+        );
+        assert_eq!(
+            resolve_window_pos_in_work_area(Some([2100, 180]), size, right_monitor),
+            [2100, 180]
+        );
+
+        // Clamping saved position on the same monitor when partially overflowing right/bottom edge
+        assert_eq!(
+            resolve_window_pos_in_work_area(Some([3600, 750]), size, right_monitor),
+            [3840 - 468, 1040 - 564]
+        );
+
+        // Re-centering onto widget's current monitor when saved position belongs to another monitor
+        assert_eq!(
+            resolve_window_pos_in_work_area(Some([200, 180]), size, right_monitor),
+            [1920 + (1920 - 468) / 2, (1040 - 564) / 2]
+        );
+        assert_eq!(
+            resolve_window_pos_in_work_area(Some([2400, 180]), size, left_monitor),
+            [-1920 + (1920 - 468) / 2, (1040 - 564) / 2]
+        );
+
+        // Small monitor where work area is smaller than window clamps safely to [left, top]
+        assert_eq!(
+            resolve_window_pos_in_work_area(None, [468, 564], [100, 50, 500, 450]),
+            [100, 50]
+        );
+    }
 
     #[test]
     fn test_clamp_rect_to_work_area() {
