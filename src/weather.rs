@@ -90,7 +90,7 @@ impl WeatherManager {
             let result = fetch_weather_blocking(&req);
             let _ = tx.send(WeatherWorkerMessage::WeatherFetched(result));
             ctx.request_repaint();
-            crate::dwm::trim_process_working_set();
+            egui_glass_ui::dwm::trim_process_working_set();
         });
     }
 
@@ -105,7 +105,7 @@ impl WeatherManager {
             let result = search_city_blocking(&trimmed);
             let _ = tx.send(WeatherWorkerMessage::CitySearchResults(result));
             ctx.request_repaint();
-            crate::dwm::trim_process_working_set();
+            egui_glass_ui::dwm::trim_process_working_set();
         });
     }
 

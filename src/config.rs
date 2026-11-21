@@ -2,67 +2,11 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
 
+pub use egui_glass_ui::{BackgroundMode, GlassTintPreset};
+
 use crate::weather::WeatherData;
 
 const CONFIG_FILE_NAME: &str = "clock_widget_config.json";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BackgroundMode {
-    FrostedGlass,
-    Transparent,
-}
-
-impl BackgroundMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            BackgroundMode::FrostedGlass => "Frosted Glass",
-            BackgroundMode::Transparent => "Transparent Mode",
-        }
-    }
-
-    pub fn toggled(self) -> Self {
-        match self {
-            BackgroundMode::FrostedGlass => BackgroundMode::Transparent,
-            BackgroundMode::Transparent => BackgroundMode::FrostedGlass,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum GlassTintPreset {
-    #[serde(alias = "MidnightDark", alias = "CharcoalSlate", alias = "OceanBlue")]
-    Dark,
-    #[serde(alias = "FrostLight", alias = "Light")]
-    Light,
-    #[serde(alias = "FollowWindows", alias = "Auto")]
-    System,
-}
-
-impl GlassTintPreset {
-    pub fn label(self) -> &'static str {
-        match self {
-            GlassTintPreset::Dark => "Dark",
-            GlassTintPreset::Light => "Light",
-            GlassTintPreset::System => "Follow System",
-        }
-    }
-
-    pub fn is_light_theme(self, windows_is_light: bool) -> bool {
-        match self {
-            GlassTintPreset::Dark => false,
-            GlassTintPreset::Light => true,
-            GlassTintPreset::System => windows_is_light,
-        }
-    }
-
-    pub fn base_rgb(self, windows_is_light: bool) -> [u8; 3] {
-        if self.is_light_theme(windows_is_light) {
-            [240, 244, 250]
-        } else {
-            [20, 22, 28]
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TempUnit {

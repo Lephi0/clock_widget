@@ -1,8 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod config;
-mod dwm;
-mod glass;
 mod hotkey;
 mod icons;
 mod settings_ui;
@@ -11,31 +9,26 @@ mod weather;
 
 use chrono::{Local, Timelike};
 use config::{BackgroundMode, GlassTintPreset, TempUnit, WidgetConfig, WeatherProvider};
-use dwm::{
-    bring_hwnd_to_front, clamp_popup_pos_to_monitor_px, configure_popup_window,
-    configure_settings_window, extract_hwnd, find_own_window_by_title, get_cursor_pos_px,
-    get_monitor_work_area_for_hwnd, get_window_pos_px, hide_popup_window, is_windows_light_theme,
-    position_popup_window_px, primary_monitor_center_pos_px, resize_window_px,
-    resolve_window_pos_in_work_area, set_window_pos_px_checked, trim_process_working_set,
-};
 use egui::{
-    Align, Align2, Color32, Context, CornerRadius, FontData, FontDefinitions, FontFamily, FontId,
-    Frame, Id, Key, Margin, Painter, PointerButton, Pos2, Rect, RichText, Sense, Stroke, Vec2,
-    ViewportBuilder, ViewportClass, ViewportCommand, ViewportId, WindowLevel,
+    Align, Align2, Color32, Context, FontFamily, FontId, Frame, Key, Margin, Painter,
+    PointerButton, Pos2, Rect, RichText, Stroke, Vec2, ViewportBuilder, ViewportCommand,
+    ViewportId, WindowLevel,
 };
-use glass::{
-    apply_glass_visuals, draw_glass_background, draw_glass_surface,
-    draw_glass_surface_with_alpha, GlassPalette, GlassStyle, GlassWindowBackdrop,
+use egui_glass_ui::{
+    bring_hwnd_to_front, draw_glass_background, draw_glass_tab_bar_with_icons,
+    draw_shadowed_text, draw_status_pill, extract_hwnd, get_window_pos_px, glass_button,
+    glass_card, glass_danger_button, glass_list_row, glass_primary_button,
+    glass_segmented_control, glass_slider_row, glass_toggle_row, install_system_font,
+    is_windows_light_theme, primary_monitor_center_pos_px, resize_window_px,
+    set_window_pos_px_checked, trim_process_working_set, GlassContextMenu, GlassMenuEntry,
+    GlassPalette, GlassStyle, GlassWindow, GlassWindowBackdrop, GlassWindowConfig,
 };
 use hotkey::{capture_egui_shortcut, HotkeyController};
 use icons::draw_weather_icon;
 use settings_ui::{
-    draw_settings_tab_bar, draw_settings_titlebar, draw_status_pill, glass_button, glass_card,
-    glass_location_result_row, glass_primary_button, glass_recording_button,
-    glass_segmented_control, glass_slider_row, glass_toggle_row, OptionsWindowState, SettingsTab,
-    OPTIONS_WINDOW_HEIGHT, OPTIONS_WINDOW_TITLE, OPTIONS_WINDOW_WIDTH,
+    draw_mini_app_badge, draw_settings_tab_icon, SettingsTab, OPTIONS_WINDOW_HEIGHT,
+    OPTIONS_WINDOW_TITLE, OPTIONS_WINDOW_WIDTH,
 };
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tray::{TrayAction, TrayController};
 use weather::{
@@ -47,9 +40,6 @@ const WIDGET_WIDTH: f32 = 348.0;
 const WIDGET_HEIGHT: f32 = 176.0;
 const CONTEXT_MENU_WINDOW_TITLE: &str = "Clock & Weather Context Menu";
 const CONTEXT_MENU_WIDTH: f32 = 236.0;
-const CONTEXT_MENU_HEIGHT: f32 = 178.0;
-const CONTEXT_MENU_FADE_IN_SECS: f32 = 0.15;
-const CONTEXT_MENU_FADE_OUT_SECS: f32 = 0.12;
 const CARD_MARGIN: f32 = 0.0;
 
 fn base_widget_size(config: &WidgetConfig) -> Vec2 {
@@ -121,86 +111,18 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-fn install_system_font(ctx: &Context) {
-    let candidates = [
-        r"C:\Windows\Fonts\segoeui.ttf",
-        r"C:\Windows\Fonts\arial.ttf",
-        r"C:\Windows\Fonts\tahoma.ttf",
-    ];
-    for path in candidates {
-        if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = FontDefinitions::empty();
-            fonts
-                .font_data
-                .insert("sys_ui".to_owned(), Arc::new(FontData::from_owned(bytes)));
-            fonts
-                .families
-                .entry(FontFamily::Proportional)
-                .or_default()
-                .push("sys_ui".to_owned());
-            fonts
-                .families
-                .entry(FontFamily::Monospace)
-                .or_default()
-                .push("sys_ui".to_owned());
-            ctx.set_fonts(fonts);
-            return;
-        }
-    }
-}
-
-struct ContextMenuState {
-    open: bool,
-    closing: bool,
-    revealed: bool,
-    activated: bool,
-    locked_pos_px: [i32; 2],
-    locked_size_px: [i32; 2],
-    locked_logical_pos: Pos2,
-    embedded_pos: Pos2,
-    hwnd: Option<isize>,
-    glass_backdrop: GlassWindowBackdrop,
-    needs_reposition: bool,
-    had_focus: bool,
-    opened_at: Option<Instant>,
-    fade_started_at: Option<Instant>,
-    fade_from_alpha: f32,
-    current_alpha: f32,
-}
-
-impl Default for ContextMenuState {
-    fn default() -> Self {
-        Self {
-            open: false,
-            closing: false,
-            revealed: false,
-            activated: false,
-            locked_pos_px: [0, 0],
-            locked_size_px: [0, 0],
-            locked_logical_pos: Pos2::ZERO,
-            embedded_pos: Pos2::ZERO,
-            hwnd: None,
-            glass_backdrop: GlassWindowBackdrop::new(),
-            needs_reposition: false,
-            had_focus: false,
-            opened_at: None,
-            fade_started_at: None,
-            fade_from_alpha: 0.0,
-            current_alpha: 0.0,
-        }
-    }
-}
-
-impl ContextMenuState {
-    fn is_animating(&self) -> bool {
-        self.open
-            && (!self.revealed || !self.activated || self.closing || self.current_alpha < 0.999)
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContextMenuAction {
+    ToggleCompactMode,
+    ToggleTransparentMode,
+    ToggleShowSeconds,
+    ToggleAlwaysOnTop,
+    OpenOptions,
+    CloseApp,
 }
 
 struct ClockWeatherWidgetApp {
     config: WidgetConfig,
-    app_icon: egui::IconData,
     hwnd: Option<isize>,
     windows_is_light: bool,
     widget_glass_backdrop: GlassWindowBackdrop,
@@ -222,8 +144,9 @@ struct ClockWeatherWidgetApp {
     pos_dirty_since: Option<Instant>,
 
     // Context menu & Options window state
-    context_menu: ContextMenuState,
-    options_window: OptionsWindowState,
+    context_menu: GlassContextMenu,
+    options_window: Option<GlassWindow>,
+    active_settings_tab: SettingsTab,
 
     // Options window editable buffers
     city_search_query: String,
@@ -280,9 +203,23 @@ impl ClockWeatherWidgetApp {
         let location_name_input = config.location_name.clone();
         let hotkey_input = config.toggle_aot_hotkey.clone();
 
+        let context_menu = GlassContextMenu::new(
+            "clock_widget_context_menu_viewport",
+            CONTEXT_MENU_WINDOW_TITLE,
+        )
+        .with_width(CONTEXT_MENU_WIDTH);
+
+        let options_window = Some(GlassWindow::new(
+            GlassWindowConfig::new(
+                "clock_widget_options_viewport",
+                OPTIONS_WINDOW_TITLE,
+                Vec2::new(OPTIONS_WINDOW_WIDTH, OPTIONS_WINDOW_HEIGHT),
+            )
+            .with_icon(app_icon),
+        ));
+
         let mut app = Self {
             config,
-            app_icon,
             hwnd,
             windows_is_light,
             widget_glass_backdrop: GlassWindowBackdrop::new(),
@@ -296,8 +233,9 @@ impl ClockWeatherWidgetApp {
             last_weather_fetch: None,
             last_observed_pos_px: Some(actual_px),
             pos_dirty_since: None,
-            context_menu: ContextMenuState::default(),
-            options_window: OptionsWindowState::default(),
+            context_menu,
+            options_window,
+            active_settings_tab: SettingsTab::default(),
             city_search_query: String::new(),
             city_search_results: Vec::new(),
             city_search_error: None,
@@ -343,7 +281,11 @@ impl ClockWeatherWidgetApp {
     }
 
     fn current_glass_style(&self) -> GlassStyle {
-        GlassStyle::from_config(&self.config, self.windows_is_light)
+        GlassStyle::new(
+            self.config.glass_tint_preset,
+            self.config.glass_tint_opacity,
+            self.windows_is_light,
+        )
     }
 
     fn ensure_window_size_synced(&mut self, ctx: &Context) {
@@ -483,13 +425,15 @@ impl ClockWeatherWidgetApp {
                     self.set_background_mode(ctx, next);
                 }
                 TrayAction::OpenOptions => {
-                    self.begin_close_context_menu(ctx);
+                    self.context_menu.begin_close(ctx);
                     self.open_options_window(ctx);
                 }
                 TrayAction::CloseApp => {
-                    self.finish_close_context_menu();
+                    self.context_menu.close_immediately();
                     self.persist_options_window_pos();
-                    hide_popup_window(self.options_window.hwnd);
+                    if let Some(win) = &self.options_window {
+                        win.hide();
+                    }
                     let _ = self.config.save();
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
@@ -527,8 +471,10 @@ impl ClockWeatherWidgetApp {
                 }
             }
         }
-        if received_weather_msg && self.options_window.open {
-            ctx.request_repaint_of(ViewportId::from_hash_of("clock_widget_options_viewport"));
+        if received_weather_msg {
+            if let Some(win) = &self.options_window {
+                win.request_repaint(ctx);
+            }
         }
 
         // 4. Periodic 20-minute weather refresh (skipped in Compact Mode to save resources)
@@ -580,7 +526,11 @@ impl eframe::App for ClockWeatherWidgetApp {
         if let Some(pos_px) = get_window_pos_px(self.hwnd).or(self.last_observed_pos_px) {
             self.config.window_pos = Some([pos_px[0] as f32, pos_px[1] as f32]);
         }
+        self.context_menu.close_immediately();
         self.persist_options_window_pos();
+        if let Some(win) = &self.options_window {
+            win.hide();
+        }
         let _ = self.config.save();
     }
 
@@ -609,12 +559,12 @@ impl eframe::App for ClockWeatherWidgetApp {
             });
 
         // 4. Render Right-Click Context Menu Window in its own native glass viewport when open
-        if self.context_menu.open {
+        if self.context_menu.is_open() {
             self.show_context_menu_viewport(ctx);
         }
 
         // 5. Render Options Window in its own native glass viewport when open
-        if self.options_window.open {
+        if self.options_window.as_ref().is_some_and(|w| w.is_open()) {
             self.show_options_viewport(ctx);
         }
 
@@ -645,15 +595,23 @@ impl eframe::App for ClockWeatherWidgetApp {
             Duration::from_millis(ms_until_next_minute.min(2500))
         };
 
-        if self.context_menu.is_animating()
-            || (self.options_window.open && !self.options_window.activated)
-        {
+        let options_open = self.options_window.as_ref().is_some_and(|w| w.is_open());
+        let options_activating = self
+            .options_window
+            .as_ref()
+            .is_some_and(|w| w.is_activating());
+        let options_pos_dirty = self
+            .options_window
+            .as_ref()
+            .is_some_and(|w| w.has_pending_pos_save());
+
+        if self.context_menu.is_animating() || options_activating {
             next_repaint = next_repaint.min(Duration::from_millis(16));
-        } else if self.context_menu.open {
+        } else if self.context_menu.is_open() {
             next_repaint = next_repaint.min(Duration::from_millis(100));
-        } else if self.pos_dirty_since.is_some() || self.options_window.pos_dirty_since.is_some() {
+        } else if self.pos_dirty_since.is_some() || options_pos_dirty {
             next_repaint = next_repaint.min(Duration::from_millis(200));
-        } else if self.options_window.open {
+        } else if options_open {
             next_repaint = next_repaint.min(Duration::from_millis(250));
         }
 
@@ -1032,66 +990,42 @@ impl ClockWeatherWidgetApp {
         }
     }
 
+    fn build_context_menu_entries(&self) -> Vec<GlassMenuEntry<ContextMenuAction>> {
+        let aot_shortcut = self.hotkey_controller.active_shortcut_str.clone();
+        vec![
+            GlassMenuEntry::toggle(
+                ContextMenuAction::ToggleCompactMode,
+                "Compact Mode",
+                self.config.compact_mode,
+            ),
+            GlassMenuEntry::toggle(
+                ContextMenuAction::ToggleTransparentMode,
+                "Transparent Mode",
+                !self.config.compact_mode
+                    && self.config.background_mode == BackgroundMode::Transparent,
+            ),
+            GlassMenuEntry::toggle(
+                ContextMenuAction::ToggleShowSeconds,
+                "Show Seconds",
+                self.config.show_seconds,
+            ),
+            GlassMenuEntry::toggle(
+                ContextMenuAction::ToggleAlwaysOnTop,
+                "Always on Top",
+                self.config.always_on_top,
+            )
+            .with_shortcut(aot_shortcut),
+            GlassMenuEntry::divider(),
+            GlassMenuEntry::item(ContextMenuAction::OpenOptions, "Options..."),
+            GlassMenuEntry::divider(),
+            GlassMenuEntry::danger(ContextMenuAction::CloseApp, "Close"),
+        ]
+    }
+
     fn open_context_menu(&mut self, root_ctx: &Context, click_pos: Pos2) {
-        let ppp = root_ctx.pixels_per_point().max(1.0);
-        let menu_w_px = (CONTEXT_MENU_WIDTH * ppp).round() as i32;
-        let menu_h_px = (CONTEXT_MENU_HEIGHT * ppp).round() as i32;
-        let anchor_px = get_cursor_pos_px()
-            .or_else(|| {
-                get_window_pos_px(self.hwnd).map(|[wx, wy]| {
-                    [
-                        wx + (click_pos.x * ppp).round() as i32,
-                        wy + (click_pos.y * ppp).round() as i32,
-                    ]
-                })
-            })
-            .unwrap_or([240, 180]);
-        let pos_px = clamp_popup_pos_to_monitor_px(anchor_px, menu_w_px, menu_h_px);
-        let logical_pos = Pos2::new(pos_px[0] as f32 / ppp, pos_px[1] as f32 / ppp);
-
-        self.context_menu.locked_pos_px = pos_px;
-        self.context_menu.locked_size_px = [menu_w_px, menu_h_px];
-        self.context_menu.locked_logical_pos = logical_pos;
-        self.context_menu.embedded_pos = click_pos;
-
-        if self.context_menu.open {
-            self.context_menu.closing = false;
-            self.context_menu.needs_reposition = true;
-            self.context_menu.had_focus = false;
-            self.context_menu.opened_at = Some(Instant::now());
-            self.context_menu.fade_started_at = Some(Instant::now());
-            self.context_menu.fade_from_alpha = 0.0;
-            self.context_menu.current_alpha = 0.0;
-        } else {
-            self.context_menu.open = true;
-            self.context_menu.closing = false;
-            self.context_menu.revealed = false;
-            self.context_menu.activated = false;
-            self.context_menu.needs_reposition = true;
-            self.context_menu.had_focus = false;
-            self.context_menu.opened_at = None;
-            self.context_menu.fade_started_at = None;
-            self.context_menu.fade_from_alpha = 0.0;
-            self.context_menu.current_alpha = 0.0;
-        }
-        root_ctx.request_repaint();
-    }
-
-    fn begin_close_context_menu(&mut self, root_ctx: &Context) {
-        if self.context_menu.open && !self.context_menu.closing {
-            self.context_menu.closing = true;
-            self.context_menu.fade_from_alpha = self.context_menu.current_alpha;
-            self.context_menu.fade_started_at = Some(Instant::now());
-            root_ctx.request_repaint();
-        }
-    }
-
-    fn finish_close_context_menu(&mut self) {
-        if self.context_menu.open {
-            hide_popup_window(self.context_menu.hwnd);
-            self.context_menu = ContextMenuState::default();
-            trim_process_working_set();
-        }
+        let entries = self.build_context_menu_entries();
+        self.context_menu
+            .open_for_entries(root_ctx, self.hwnd, click_pos, &entries);
     }
 
     fn handle_widget_interactions(&mut self, ctx: &Context, _ui: &mut egui::Ui, card_rect: Rect) {
@@ -1109,16 +1043,9 @@ impl ClockWeatherWidgetApp {
             return;
         }
 
-        if self.context_menu.open {
+        if self.context_menu.is_open() {
             // Dismiss context menu on Escape or primary click on the root widget (without starting a drag)
-            if !self.context_menu.closing {
-                let dismiss_from_widget = ctx.input(|i| {
-                    i.key_pressed(Key::Escape) || i.pointer.button_pressed(PointerButton::Primary)
-                });
-                if dismiss_from_widget {
-                    self.begin_close_context_menu(ctx);
-                }
-            }
+            self.context_menu.handle_root_dismiss(ctx);
         } else {
             // When context menu is not open, left-clicking and dragging anywhere moves the widget smoothly
             let start_drag = ctx.input(|i| {
@@ -1134,684 +1061,124 @@ impl ClockWeatherWidgetApp {
     }
 
     fn show_context_menu_viewport(&mut self, root_ctx: &Context) {
-        let menu_size = Vec2::new(CONTEXT_MENU_WIDTH, CONTEXT_MENU_HEIGHT);
-        let pos_px = self.context_menu.locked_pos_px;
-        let size_px = self.context_menu.locked_size_px;
-        let logical_pos = self.context_menu.locked_logical_pos;
-
-        let viewport_id = ViewportId::from_hash_of("clock_widget_context_menu_viewport");
-        let builder = ViewportBuilder::default()
-            .with_title(CONTEXT_MENU_WINDOW_TITLE)
-            .with_inner_size([menu_size.x, menu_size.y])
-            .with_min_inner_size([menu_size.x, menu_size.y])
-            .with_max_inner_size([menu_size.x, menu_size.y])
-            .with_position(logical_pos)
-            .with_visible(self.context_menu.revealed)
-            .with_decorations(false)
-            .with_minimize_button(false)
-            .with_maximize_button(false)
-            .with_close_button(false)
-            .with_transparent(true)
-            .with_taskbar(false)
-            .with_resizable(false)
-            .with_window_level(WindowLevel::AlwaysOnTop);
-
-        root_ctx.show_viewport_immediate(viewport_id, builder, |menu_ctx, class| {
-            if class == ViewportClass::Embedded {
-                if !self.context_menu.revealed || !self.context_menu.activated {
-                    self.context_menu.revealed = true;
-                    self.context_menu.activated = true;
-                    self.context_menu.fade_started_at = Some(Instant::now());
-                    self.context_menu.fade_from_alpha = 0.0;
-                }
-
-                let bounds_rect = Rect::from_min_size(Pos2::ZERO, self.desired_window_size());
-                let max_x = (bounds_rect.max.x - menu_size.x - 4.0).max(bounds_rect.min.x + 4.0);
-                let max_y = (bounds_rect.max.y - menu_size.y - 4.0).max(bounds_rect.min.y + 4.0);
-                let min_x = self
-                    .context_menu
-                    .embedded_pos
-                    .x
-                    .clamp(bounds_rect.min.x + 4.0, max_x);
-                let min_y = self
-                    .context_menu
-                    .embedded_pos
-                    .y
-                    .clamp(bounds_rect.min.y + 4.0, max_y);
-                let menu_rect = Rect::from_min_size(Pos2::new(min_x, min_y), menu_size);
-
-                let elapsed_secs = self
-                    .context_menu
-                    .fade_started_at
-                    .map_or(0.0, |t| t.elapsed().as_secs_f32());
-                let (alpha, anim_done) = context_menu_fade_alpha(
-                    self.context_menu.closing,
-                    elapsed_secs,
-                    self.context_menu.fade_from_alpha,
-                );
-                self.context_menu.current_alpha = alpha;
-
-                if self.context_menu.closing && anim_done {
-                    self.finish_close_context_menu();
-                    root_ctx.request_repaint();
-                    return;
-                }
-
-                if !self.context_menu.closing {
-                    let close_outside = menu_ctx.input(|i| {
-                        i.key_pressed(Key::Escape)
-                            || (i.pointer.button_pressed(PointerButton::Primary)
-                                && i.pointer
-                                    .interact_pos()
-                                    .map_or(false, |p| !menu_rect.contains(p)))
-                    });
-                    if close_outside {
-                        self.begin_close_context_menu(root_ctx);
-                    }
-                }
-
-                if !anim_done || self.context_menu.closing {
-                    menu_ctx.request_repaint();
-                    root_ctx.request_repaint();
-                }
-
-                egui::Area::new(Id::new("embedded_ctx_menu_area"))
-                    .fixed_pos(menu_rect.min)
-                    .order(egui::Order::Foreground)
-                    .show(menu_ctx, |ui| {
-                        let (rect, _) = ui.allocate_exact_size(menu_size, Sense::hover());
-                        self.render_context_menu_surface(root_ctx, ui, rect, alpha);
-                    });
-                return;
-            }
-
-            // 1. Discover popup HWND owned by this process
-            if self.context_menu.hwnd.is_none() {
-                self.context_menu.hwnd = find_own_window_by_title(CONTEXT_MENU_WINDOW_TITLE);
-                if self.context_menu.hwnd.is_none() {
-                    root_ctx.request_repaint();
-                    return;
-                }
-            }
-
-            let glass_style = self.current_glass_style();
-
-            // 2. Frame 1 (window still hidden): disable DWM transitions, set tool-window style,
-            // sync Acrylic backdrop, and place at exact physical coordinates before ever showing.
-            if !self.context_menu.revealed {
-                configure_popup_window(self.context_menu.hwnd);
-                self.context_menu.glass_backdrop.sync(
-                    self.context_menu.hwnd,
-                    BackgroundMode::FrostedGlass,
-                    glass_style.is_light(),
-                );
-                position_popup_window_px(
-                    self.context_menu.hwnd,
-                    pos_px[0],
-                    pos_px[1],
-                    size_px[0],
-                    size_px[1],
-                    false,
-                );
-
-                egui::CentralPanel::default()
-                    .frame(Frame::NONE.fill(Color32::TRANSPARENT))
-                    .show(menu_ctx, |ui| {
-                        let menu_rect = ui.max_rect();
-                        self.render_context_menu_surface(root_ctx, ui, menu_rect, 0.0);
-                    });
-
-                self.context_menu.revealed = true;
-                self.context_menu.needs_reposition = false;
-                self.context_menu.current_alpha = 0.0;
-                menu_ctx.request_repaint();
-                root_ctx.request_repaint();
-                return;
-            }
-
-            // 3. Frame 2+: keep DWM backdrop synced and reveal/reposition in place without SW_RESTORE
-            self.context_menu.glass_backdrop.sync(
-                self.context_menu.hwnd,
-                BackgroundMode::FrostedGlass,
-                glass_style.is_light(),
-            );
-
-            if !self.context_menu.activated || self.context_menu.needs_reposition {
-                configure_popup_window(self.context_menu.hwnd);
-                position_popup_window_px(
-                    self.context_menu.hwnd,
-                    pos_px[0],
-                    pos_px[1],
-                    size_px[0],
-                    size_px[1],
-                    true,
-                );
-                self.context_menu.glass_backdrop.invalidate();
-                self.context_menu.glass_backdrop.sync(
-                    self.context_menu.hwnd,
-                    BackgroundMode::FrostedGlass,
-                    glass_style.is_light(),
-                );
-                if !self.context_menu.activated {
-                    self.context_menu.activated = true;
-                    self.context_menu.opened_at = Some(Instant::now());
-                    self.context_menu.fade_started_at = Some(Instant::now());
-                    self.context_menu.fade_from_alpha = 0.0;
-                }
-                self.context_menu.needs_reposition = false;
-            }
-
-            // 4. Advance pure fade-in / fade-out curve
-            let elapsed_secs = self
-                .context_menu
-                .fade_started_at
-                .map_or(0.0, |t| t.elapsed().as_secs_f32());
-            let (alpha, anim_done) = context_menu_fade_alpha(
-                self.context_menu.closing,
-                elapsed_secs,
-                self.context_menu.fade_from_alpha,
-            );
-            self.context_menu.current_alpha = alpha;
-
-            if self.context_menu.closing && anim_done {
-                self.finish_close_context_menu();
-                root_ctx.request_repaint();
-                return;
-            }
-
-            // 5. Track focus and begin fade-out on close request, Escape, or focus loss
-            if !self.context_menu.closing {
-                let (close_req, esc_pressed, focused) = menu_ctx.input(|i| {
-                    (
-                        i.viewport().close_requested(),
-                        i.key_pressed(Key::Escape),
-                        i.viewport().focused,
-                    )
-                });
-                if focused == Some(true) {
-                    self.context_menu.had_focus = true;
-                }
-                let grace_elapsed = self
-                    .context_menu
-                    .opened_at
-                    .map_or(false, |t| t.elapsed() >= Duration::from_millis(250));
-                let lost_focus =
-                    focused == Some(false) && (self.context_menu.had_focus || grace_elapsed);
-
-                if close_req || esc_pressed || lost_focus {
-                    self.begin_close_context_menu(root_ctx);
-                }
-            }
-
-            if !anim_done || self.context_menu.closing {
-                menu_ctx.request_repaint();
-                root_ctx.request_repaint();
-            }
-
-            egui::CentralPanel::default()
-                .frame(Frame::NONE.fill(Color32::TRANSPARENT))
-                .show(menu_ctx, |ui| {
-                    let menu_rect = ui.max_rect();
-                    self.render_context_menu_surface(root_ctx, ui, menu_rect, alpha);
-                });
-        });
-    }
-
-    fn render_context_menu_surface(
-        &mut self,
-        root_ctx: &Context,
-        ui: &mut egui::Ui,
-        menu_rect: Rect,
-        fade_alpha: f32,
-    ) {
-        let fade_alpha = fade_alpha.clamp(0.0, 1.0);
         let glass_style = self.current_glass_style();
-        let palette = glass_style.palette();
-        let painter = ui.painter();
+        let entries = self.build_context_menu_entries();
+        let embedded_bounds = self.desired_window_size();
 
-        // Reusable frosted glass panel matching widget tint & Windows DWM Acrylic backdrop
-        draw_glass_surface_with_alpha(painter, menu_rect, &glass_style, fade_alpha);
-
-        let inner = menu_rect.shrink(6.0);
-        let row_h = 23.0;
-        let interactive = !self.context_menu.closing;
-
-        let aot_shortcut = self.hotkey_controller.active_shortcut_str.clone();
-
-        let rows: [(&str, bool, Option<&str>, bool); 6] = [
-            ("Compact Mode", self.config.compact_mode, None, false),
-            (
-                "Transparent Mode",
-                !self.config.compact_mode
-                    && self.config.background_mode == BackgroundMode::Transparent,
-                None,
-                false,
-            ),
-            ("Show Seconds", self.config.show_seconds, None, false),
-            (
-                "Always on Top",
-                self.config.always_on_top,
-                Some(&aot_shortcut),
-                false,
-            ),
-            ("Options...", false, None, false),
-            ("Close", false, None, true),
-        ];
-
-        let mut cur_y = inner.min.y;
-        for (idx, (label, is_checked, right_badge, is_danger)) in rows.iter().enumerate() {
-            if idx == 4 || idx == 5 {
-                let div_y = cur_y + 5.5;
-                painter.line_segment(
-                    [
-                        Pos2::new(inner.min.x + 8.0, div_y),
-                        Pos2::new(inner.max.x - 8.0, div_y),
-                    ],
-                    Stroke::new(1.0_f32, palette.divider.gamma_multiply(fade_alpha)),
-                );
-                cur_y += 11.0;
-            }
-
-            let item_rect =
-                Rect::from_min_size(Pos2::new(inner.min.x, cur_y), Vec2::new(inner.width(), row_h));
-            cur_y += if idx == 3 || idx == 4 {
-                row_h
-            } else {
-                row_h + 2.0
-            };
-
-            let resp = ui.interact(
-                item_rect,
-                Id::new(("ctx_menu_row", idx)),
-                Sense::click(),
-            );
-            let is_hovered = interactive && resp.hovered();
-
-            if is_hovered {
-                let hover_fill = if *is_danger {
-                    palette.danger_hover_fill
-                } else {
-                    palette.item_hover_fill
-                };
-                painter.rect_filled(
-                    item_rect,
-                    CornerRadius::same(7),
-                    hover_fill.gamma_multiply(fade_alpha),
-                );
-            }
-
-            let text_color = if is_hovered {
-                palette.item_hover_text
-            } else if *is_danger {
-                palette.danger_text
-            } else {
-                palette.primary_text
-            }
-            .gamma_multiply(fade_alpha);
-
-            if *is_checked {
-                let cx = item_rect.min.x + 13.0;
-                let cy = item_rect.center().y;
-                let stroke = Stroke::new(1.6_f32, text_color);
-                painter.line_segment(
-                    [Pos2::new(cx - 4.0, cy + 0.2), Pos2::new(cx - 1.2, cy + 3.0)],
-                    stroke,
-                );
-                painter.line_segment(
-                    [Pos2::new(cx - 1.2, cy + 3.0), Pos2::new(cx + 4.2, cy - 3.0)],
-                    stroke,
-                );
-            }
-
-            painter.text(
-                Pos2::new(item_rect.min.x + 26.0, item_rect.center().y),
-                Align2::LEFT_CENTER,
-                *label,
-                FontId::new(12.5, FontFamily::Proportional),
-                text_color,
-            );
-
-            if let Some(badge) = right_badge {
-                let badge_color = if is_hovered {
-                    palette.item_hover_secondary_text
-                } else {
-                    palette.secondary_text
+        if let Some(action) =
+            self.context_menu
+                .show(root_ctx, &glass_style, embedded_bounds, &entries)
+        {
+            match action {
+                ContextMenuAction::ToggleCompactMode => {
+                    let next = !self.config.compact_mode;
+                    self.set_compact_mode(root_ctx, next);
                 }
-                .gamma_multiply(fade_alpha);
-                painter.text(
-                    Pos2::new(item_rect.max.x - 8.0, item_rect.center().y),
-                    Align2::RIGHT_CENTER,
-                    *badge,
-                    FontId::new(10.5, FontFamily::Proportional),
-                    badge_color,
-                );
-            }
-
-            if interactive && resp.clicked() {
-                match idx {
-                    0 => {
-                        self.begin_close_context_menu(root_ctx);
-                        let next = !self.config.compact_mode;
-                        self.set_compact_mode(root_ctx, next);
-                    }
-                    1 => {
-                        self.begin_close_context_menu(root_ctx);
-                        let next = if self.config.compact_mode {
-                            BackgroundMode::Transparent
-                        } else {
-                            self.config.background_mode.toggled()
-                        };
-                        self.set_background_mode(root_ctx, next);
-                    }
-                    2 => {
-                        self.begin_close_context_menu(root_ctx);
-                        self.config.show_seconds = !self.config.show_seconds;
-                        self.measured_compact_size = None;
-                        self.ensure_window_size_synced(root_ctx);
-                        let _ = self.config.save();
-                    }
-                    3 => {
-                        self.begin_close_context_menu(root_ctx);
-                        self.toggle_always_on_top(root_ctx);
-                    }
-                    4 => {
-                        self.begin_close_context_menu(root_ctx);
-                        self.open_options_window(root_ctx);
-                    }
-                    5 => {
-                        self.finish_close_context_menu();
-                        self.persist_options_window_pos();
-                        hide_popup_window(self.options_window.hwnd);
-                        let _ = self.config.save();
-                        root_ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
-                    }
-                    _ => {}
+                ContextMenuAction::ToggleTransparentMode => {
+                    let next = if self.config.compact_mode {
+                        BackgroundMode::Transparent
+                    } else {
+                        self.config.background_mode.toggled()
+                    };
+                    self.set_background_mode(root_ctx, next);
                 }
-                root_ctx.request_repaint();
+                ContextMenuAction::ToggleShowSeconds => {
+                    self.config.show_seconds = !self.config.show_seconds;
+                    self.measured_compact_size = None;
+                    self.ensure_window_size_synced(root_ctx);
+                    let _ = self.config.save();
+                }
+                ContextMenuAction::ToggleAlwaysOnTop => {
+                    self.toggle_always_on_top(root_ctx);
+                }
+                ContextMenuAction::OpenOptions => {
+                    self.open_options_window(root_ctx);
+                }
+                ContextMenuAction::CloseApp => {
+                    self.context_menu.close_immediately();
+                    self.persist_options_window_pos();
+                    if let Some(win) = &self.options_window {
+                        win.hide();
+                    }
+                    let _ = self.config.save();
+                    root_ctx.send_viewport_cmd_to(ViewportId::ROOT, ViewportCommand::Close);
+                }
             }
+            root_ctx.request_repaint();
         }
     }
 
     fn open_options_window(&mut self, root_ctx: &Context) {
-        if self.options_window.open {
-            bring_hwnd_to_front(self.options_window.hwnd);
-            return;
-        }
-
-        let work_rect = get_monitor_work_area_for_hwnd(self.hwnd, self.last_observed_pos_px);
-        let ppp = root_ctx.pixels_per_point().max(1.0);
-        let work_h_logical = ((work_rect[3] - work_rect[1]) as f32 / ppp).max(400.0);
-        let logical_h = OPTIONS_WINDOW_HEIGHT
-            .min((work_h_logical - 32.0).max(400.0))
-            .round();
-        let logical_size = Vec2::new(OPTIONS_WINDOW_WIDTH, logical_h);
-        let size_px = [
-            (logical_size.x * ppp).round() as i32,
-            (logical_size.y * ppp).round() as i32,
-        ];
         let saved_px = self
             .config
             .options_window_pos
             .map(|[x, y]| [x.round() as i32, y.round() as i32]);
-        let pos_px = resolve_window_pos_in_work_area(saved_px, size_px, work_rect);
-        let logical_pos = Pos2::new(pos_px[0] as f32 / ppp, pos_px[1] as f32 / ppp);
-
-        self.options_window.reset_keeping_tab();
-        self.options_window.open = true;
-        self.options_window.logical_size = logical_size;
-        self.options_window.locked_pos_px = pos_px;
-        self.options_window.locked_size_px = size_px;
-        self.options_window.locked_logical_pos = logical_pos;
-        self.options_window.last_observed_pos_px = Some(pos_px);
-        root_ctx.request_repaint();
+        if let Some(win) = &mut self.options_window {
+            win.open(root_ctx, self.hwnd, self.last_observed_pos_px, saved_px);
+        }
     }
 
     fn persist_options_window_pos(&mut self) {
-        if self.options_window.open && self.options_window.activated {
-            if let Some(pos_px) = get_window_pos_px(self.options_window.hwnd)
-                .or(self.options_window.last_observed_pos_px)
-            {
-                self.config.options_window_pos = Some([pos_px[0] as f32, pos_px[1] as f32]);
-            }
+        if let Some(pos_px) = self
+            .options_window
+            .as_ref()
+            .and_then(|win| win.current_pos_px())
+        {
+            self.config.options_window_pos = Some([pos_px[0] as f32, pos_px[1] as f32]);
         }
-    }
-
-    fn close_options_window(&mut self) {
-        if !self.options_window.open {
-            return;
-        }
-        self.persist_options_window_pos();
-        let _ = self.config.save();
-        hide_popup_window(self.options_window.hwnd);
-        self.options_window.reset_keeping_tab();
-        self.recording_hotkey = false;
-        trim_process_working_set();
     }
 
     fn show_options_viewport(&mut self, root_ctx: &Context) {
-        let logical_size = self.options_window.logical_size;
-        let pos_px = self.options_window.locked_pos_px;
-        let size_px = self.options_window.locked_size_px;
+        let Some(mut win) = self.options_window.take() else {
+            return;
+        };
 
-        let viewport_id = ViewportId::from_hash_of("clock_widget_options_viewport");
-        let mut builder = ViewportBuilder::default()
-            .with_title(OPTIONS_WINDOW_TITLE)
-            .with_inner_size([logical_size.x, logical_size.y])
-            .with_min_inner_size([logical_size.x, logical_size.y])
-            .with_max_inner_size([logical_size.x, logical_size.y])
-            .with_visible(self.options_window.revealed)
-            .with_decorations(false)
-            .with_minimize_button(false)
-            .with_maximize_button(false)
-            .with_close_button(false)
-            .with_transparent(true)
-            .with_resizable(false)
-            .with_window_level(WindowLevel::AlwaysOnTop)
-            .with_icon(self.app_icon.clone());
+        let glass_style = self.current_glass_style();
+        let allow_esc_close = !self.recording_hotkey;
+        let active_tab = std::cell::Cell::new(self.active_settings_tab);
+        let resp = win.show_framed(
+            root_ctx,
+            &glass_style,
+            allow_esc_close,
+            Some(&draw_mini_app_badge),
+            |_opt_ctx, ui, palette| {
+                Frame::NONE
+                    .inner_margin(Margin::symmetric(16, 0))
+                    .show(ui, |ui| {
+                        let mut tab = active_tab.get();
+                        if draw_glass_tab_bar_with_icons(
+                            ui,
+                            "settings_tab",
+                            palette,
+                            &SettingsTab::TABS,
+                            &mut tab,
+                            draw_settings_tab_icon,
+                        ) {
+                            active_tab.set(tab);
+                        }
+                    });
+                ui.add_space(10.0);
+            },
+            |opt_ctx, ui, palette| {
+                self.render_options_contents(root_ctx, opt_ctx, ui, palette, active_tab.get());
+            },
+        );
 
-        if !self.options_window.activated {
-            builder = builder.with_position(self.options_window.locked_logical_pos);
+        self.active_settings_tab = active_tab.get();
+        self.options_window = Some(win);
+
+        if let Some(pos_px) = resp.persisted_pos_px {
+            let pos_f = [pos_px[0] as f32, pos_px[1] as f32];
+            if self.config.options_window_pos != Some(pos_f) {
+                self.config.options_window_pos = Some(pos_f);
+                let _ = self.config.save();
+            }
         }
 
-        root_ctx.show_viewport_immediate(viewport_id, builder, |opt_ctx, class| {
-            let glass_style = self.current_glass_style();
-            let palette = glass_style.palette();
-            apply_glass_visuals(opt_ctx, &glass_style);
-
-            if class == ViewportClass::Embedded {
-                let mut open = self.options_window.open;
-                let mut done_clicked = false;
-                egui::Window::new(OPTIONS_WINDOW_TITLE)
-                    .open(&mut open)
-                    .show(opt_ctx, |ui| {
-                        done_clicked = self.render_options_frame(
-                            root_ctx,
-                            opt_ctx,
-                            ui,
-                            &glass_style,
-                            &palette,
-                        );
-                    });
-                if !open || done_clicked {
-                    self.close_options_window();
-                    root_ctx.request_repaint();
-                }
-                return;
-            }
-
-            if self.options_window.hwnd.is_none() {
-                self.options_window.hwnd = find_own_window_by_title(OPTIONS_WINDOW_TITLE);
-                if self.options_window.hwnd.is_none() {
-                    root_ctx.request_repaint();
-                    return;
-                }
-            }
-
-            // Frame 1 (hidden): suppress transitions, apply Acrylic glass backdrop, and place on target monitor.
-            if !self.options_window.revealed {
-                configure_settings_window(self.options_window.hwnd);
-                self.options_window.glass_backdrop.sync(
-                    self.options_window.hwnd,
-                    BackgroundMode::FrostedGlass,
-                    glass_style.is_light(),
-                );
-                position_popup_window_px(
-                    self.options_window.hwnd,
-                    pos_px[0],
-                    pos_px[1],
-                    size_px[0],
-                    size_px[1],
-                    false,
-                );
-
-                egui::CentralPanel::default()
-                    .frame(Frame::NONE.fill(Color32::TRANSPARENT))
-                    .show(opt_ctx, |ui| {
-                        let _ = self.render_options_frame(
-                            root_ctx,
-                            opt_ctx,
-                            ui,
-                            &glass_style,
-                            &palette,
-                        );
-                    });
-
-                self.options_window.revealed = true;
-                opt_ctx.request_repaint();
-                root_ctx.request_repaint();
-                return;
-            }
-
-            // Frame 2: reveal and focus cleanly without DWM transition flicker.
-            if !self.options_window.activated {
-                configure_settings_window(self.options_window.hwnd);
-                position_popup_window_px(
-                    self.options_window.hwnd,
-                    pos_px[0],
-                    pos_px[1],
-                    size_px[0],
-                    size_px[1],
-                    true,
-                );
-                self.options_window.glass_backdrop.invalidate();
-                self.options_window.glass_backdrop.sync(
-                    self.options_window.hwnd,
-                    BackgroundMode::FrostedGlass,
-                    glass_style.is_light(),
-                );
-                self.options_window.activated = true;
-
-                let actual = get_window_pos_px(self.options_window.hwnd).unwrap_or(pos_px);
-                self.options_window.last_observed_pos_px = Some(actual);
-                let actual_f = [actual[0] as f32, actual[1] as f32];
-                if self.config.options_window_pos != Some(actual_f) {
-                    self.config.options_window_pos = Some(actual_f);
-                    let _ = self.config.save();
-                }
-            } else {
-                self.options_window.glass_backdrop.sync(
-                    self.options_window.hwnd,
-                    BackgroundMode::FrostedGlass,
-                    glass_style.is_light(),
-                );
-            }
-
-            let (close_req, esc_pressed) = opt_ctx.input(|i| {
-                (
-                    i.viewport().close_requested(),
-                    i.key_pressed(Key::Escape),
-                )
-            });
-            let mut should_close = close_req
-                || (esc_pressed && !self.recording_hotkey && !opt_ctx.wants_keyboard_input());
-
-            // Track physical drag moves via Win32 GetWindowRect and debounce persistence
-            if let Some(cur_px) = get_window_pos_px(self.options_window.hwnd) {
-                let changed = match self.options_window.last_observed_pos_px {
-                    Some(prev) => (prev[0] - cur_px[0]).abs() > 1 || (prev[1] - cur_px[1]).abs() > 1,
-                    None => {
-                        self.options_window.last_observed_pos_px = Some(cur_px);
-                        false
-                    }
-                };
-                if changed {
-                    self.options_window.last_observed_pos_px = Some(cur_px);
-                    self.options_window.pos_dirty_since = Some(Instant::now());
-                }
-            }
-            if let Some(dirty_time) = self.options_window.pos_dirty_since {
-                let is_dragging = opt_ctx.input(|i| i.pointer.primary_down());
-                if !is_dragging && dirty_time.elapsed() >= Duration::from_millis(350) {
-                    if let Some(cur_px) = self.options_window.last_observed_pos_px {
-                        self.config.options_window_pos = Some([cur_px[0] as f32, cur_px[1] as f32]);
-                        let _ = self.config.save();
-                    }
-                    self.options_window.pos_dirty_since = None;
-                }
-            }
-
-            egui::CentralPanel::default()
-                .frame(Frame::NONE.fill(Color32::TRANSPARENT))
-                .show(opt_ctx, |ui| {
-                    let frame_close = self.render_options_frame(
-                        root_ctx,
-                        opt_ctx,
-                        ui,
-                        &glass_style,
-                        &palette,
-                    );
-                    should_close |= frame_close;
-                });
-
-            if should_close {
-                self.close_options_window();
-                root_ctx.request_repaint();
-            }
-        });
-    }
-
-    fn render_options_frame(
-        &mut self,
-        root_ctx: &Context,
-        opt_ctx: &Context,
-        ui: &mut egui::Ui,
-        glass_style: &GlassStyle,
-        palette: &GlassPalette,
-    ) -> bool {
-        let full_rect = ui.max_rect();
-        draw_glass_surface(ui.painter(), full_rect, glass_style);
-
-        ui.spacing_mut().item_spacing.y = 0.0;
-
-        let close_top = draw_settings_titlebar(opt_ctx, ui, palette);
-        ui.add_space(10.0);
-
-        Frame::NONE.inner_margin(Margin::symmetric(16, 0)).show(ui, |ui| {
-            draw_settings_tab_bar(ui, palette, &mut self.options_window.active_tab);
-        });
-        ui.add_space(10.0);
-
-        let scroll_h = ui.available_height().max(120.0);
-        ui.allocate_ui(Vec2::new(ui.available_width(), scroll_h), |ui| {
-            ui.set_min_size(Vec2::new(ui.available_width(), scroll_h));
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 7.0;
-                    Frame::NONE
-                        .inner_margin(Margin {
-                            left: 16,
-                            right: 16,
-                            top: 2,
-                            bottom: 14,
-                        })
-                        .show(ui, |ui| {
-                            self.render_options_contents(root_ctx, opt_ctx, ui, palette);
-                        });
-                });
-        });
-
-        close_top
+        if resp.closed {
+            self.recording_hotkey = false;
+            let _ = self.config.save();
+        }
     }
 
     fn render_options_contents(
@@ -1820,6 +1187,7 @@ impl ClockWeatherWidgetApp {
         opt_ctx: &Context,
         ui: &mut egui::Ui,
         palette: &GlassPalette,
+        active_tab: SettingsTab,
     ) {
         if self.recording_hotkey {
             if let Some(captured) = capture_egui_shortcut(opt_ctx) {
@@ -1848,7 +1216,7 @@ impl ClockWeatherWidgetApp {
             }
         }
 
-        match self.options_window.active_tab {
+        match active_tab {
             SettingsTab::Appearance => {
                 glass_card(ui, palette, "Display & Glass", |ui| {
                     let mut compact = self.config.compact_mode;
@@ -2053,13 +1421,13 @@ impl ClockWeatherWidgetApp {
                         );
                         let results = self.city_search_results.clone();
                         for (idx, loc) in results.into_iter().enumerate() {
-                            if glass_location_result_row(
+                            let coords = format!("{:.2}, {:.2}", loc.latitude, loc.longitude);
+                            if glass_list_row(
                                 ui,
                                 ("city_res", idx),
                                 palette,
                                 &loc.display_name,
-                                loc.latitude,
-                                loc.longitude,
+                                Some(&coords),
                             ) {
                                 self.config.location_name = loc.short_name.clone();
                                 self.config.latitude = loc.latitude;
@@ -2265,7 +1633,7 @@ impl ClockWeatherWidgetApp {
                         }
 
                         let rec_clicked = if self.recording_hotkey {
-                            glass_recording_button(ui, palette, "Press Keys... (Esc)").clicked()
+                            glass_danger_button(ui, palette, "Press Keys... (Esc)").clicked()
                         } else {
                             glass_button(ui, palette, "Record").clicked()
                         };
@@ -2331,50 +1699,6 @@ impl ClockWeatherWidgetApp {
     }
 }
 
-/// Computes the pure fade-in / fade-out alpha scale and completion flag for the right-click context menu.
-fn context_menu_fade_alpha(is_closing: bool, elapsed_secs: f32, start_alpha: f32) -> (f32, bool) {
-    if is_closing {
-        let t = (elapsed_secs / CONTEXT_MENU_FADE_OUT_SECS).clamp(0.0, 1.0);
-        let eased = 1.0 - (1.0 - t).powi(2);
-        let alpha = (start_alpha * (1.0 - eased)).clamp(0.0, 1.0);
-        (alpha, t >= 1.0)
-    } else {
-        let t = (elapsed_secs / CONTEXT_MENU_FADE_IN_SECS).clamp(0.0, 1.0);
-        let eased = 1.0 - (1.0 - t).powi(3);
-        let alpha = (start_alpha + (1.0 - start_alpha) * eased).clamp(0.0, 1.0);
-        (alpha, t >= 1.0)
-    }
-}
-
-/// Renders crisp text with an optional multi-pass soft drop shadow for legibility in Clear and Glass modes.
-fn draw_shadowed_text(
-    painter: &Painter,
-    pos: Pos2,
-    anchor: Align2,
-    text: &str,
-    font: FontId,
-    color: Color32,
-    shadow: bool,
-) {
-    if shadow {
-        painter.text(
-            pos + Vec2::new(0.0, 2.0),
-            anchor,
-            text,
-            font.clone(),
-            Color32::from_black_alpha(115),
-        );
-        painter.text(
-            pos + Vec2::new(0.8, 1.0),
-            anchor,
-            text,
-            font.clone(),
-            Color32::from_black_alpha(80),
-        );
-    }
-    painter.text(pos, anchor, text, font, color);
-}
-
 fn truncate_str(input: &str, max_chars: usize) -> String {
     let count = input.chars().count();
     if count <= max_chars {
@@ -2436,42 +1760,5 @@ mod tests {
         assert_eq!(h, 32);
         assert_eq!(rgba.len(), 32 * 32 * 4);
         assert!(tray::generate_widget_tray_icon().is_ok());
-    }
-
-    #[test]
-    fn test_context_menu_fade_alpha() {
-        let (start_in, done_start) = context_menu_fade_alpha(false, 0.0, 0.0);
-        assert!((start_in - 0.0).abs() < 1e-6);
-        assert!(!done_start);
-
-        let (mid_in, done_mid) =
-            context_menu_fade_alpha(false, CONTEXT_MENU_FADE_IN_SECS * 0.5, 0.0);
-        assert!(mid_in > 0.5 && mid_in < 1.0);
-        assert!(!done_mid);
-
-        let (end_in, done_in) = context_menu_fade_alpha(false, CONTEXT_MENU_FADE_IN_SECS, 0.0);
-        assert!((end_in - 1.0).abs() < 1e-6);
-        assert!(done_in);
-
-        let (start_out, done_out_start) = context_menu_fade_alpha(true, 0.0, 1.0);
-        assert!((start_out - 1.0).abs() < 1e-6);
-        assert!(!done_out_start);
-
-        let (end_out, done_out) = context_menu_fade_alpha(true, CONTEXT_MENU_FADE_OUT_SECS, 1.0);
-        assert!((end_out - 0.0).abs() < 1e-6);
-        assert!(done_out);
-
-        // Mid-fade reversal from partial alpha (0.6 -> 0.0)
-        let (rev_start, rev_done_start) = context_menu_fade_alpha(true, 0.0, 0.6);
-        assert!((rev_start - 0.6).abs() < 1e-6);
-        assert!(!rev_done_start);
-
-        let (rev_mid, _) = context_menu_fade_alpha(true, CONTEXT_MENU_FADE_OUT_SECS * 0.5, 0.6);
-        assert!(rev_mid > 0.0 && rev_mid < 0.6);
-
-        let (rev_end, rev_done_end) =
-            context_menu_fade_alpha(true, CONTEXT_MENU_FADE_OUT_SECS, 0.6);
-        assert!((rev_end - 0.0).abs() < 1e-6);
-        assert!(rev_done_end);
     }
 }

@@ -336,13 +336,12 @@ dependencies = [
  "chrono",
  "eframe",
  "egui",
+ "egui_glass_ui",
  "global-hotkey",
- "raw-window-handle",
  "serde",
  "serde_json",
  "tray-icon",
  "ureq",
- "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -595,6 +594,16 @@ dependencies = [
  "web-time",
  "webbrowser",
  "winit",
+]
+
+[[package]]
+name = "egui_glass_ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "raw-window-handle",
+ "serde",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
